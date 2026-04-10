@@ -7,7 +7,6 @@
 
 /* --- Struct Definitions --- */
 typedef struct {
-    ngx_msec_t timeout;
     ngx_http_upstream_init_pt original_init_upstream;
     ngx_http_upstream_init_peer_pt original_init_peer;
 } ngx_http_upstream_ntlm_srv_conf_t;
@@ -18,12 +17,11 @@ typedef struct {
     struct sockaddr *upstream_sockaddr;
     socklen_t upstream_socklen;
     ngx_str_t upstream_name;
-    ngx_flag_t is_pinned;
+    ngx_msec_t pinned_time;
 } ngx_http_upstream_ntlm_ctx_t;
 
 typedef struct {
     ngx_http_upstream_ntlm_ctx_t *ctx;
-    ngx_msec_t timeout;
     void *original_peer_data;
     ngx_event_get_peer_pt original_get_peer;
     ngx_event_free_peer_pt original_free_peer;
@@ -82,12 +80,6 @@ static ngx_command_t ngx_http_upstream_ntlm_commands[] = {
       NGX_HTTP_SRV_CONF_OFFSET,
       0,
       NULL },
-    { ngx_string("ntlm_timeout"),
-      NGX_HTTP_UPS_CONF | NGX_CONF_TAKE1,
-      ngx_conf_set_msec_slot,
-      NGX_HTTP_SRV_CONF_OFFSET,
-      offsetof(ngx_http_upstream_ntlm_srv_conf_t, timeout),
-      NULL },
     ngx_null_command
 };
 
@@ -142,16 +134,21 @@ ngx_http_upstream_ntlm_pinned_var(ngx_http_request_t *r, ngx_http_variable_value
 
     ctx = ngx_http_upstream_ntlm_client_get_ctx(c, 0);
 
-    if (ctx != NULL && ctx->is_pinned) {
-        v->len = 1;
-        v->data = (u_char *) "1";
+    if (ctx != NULL && ctx->pinned_time != 0) {
+        ngx_msec_t elapsed_ms = ngx_current_msec - ctx->pinned_time;
+
+        v->data = ngx_pnalloc(r->pool, NGX_INT_T_LEN);
+        if (v->data == NULL) {
+            return NGX_ERROR;
+        }
+        v->len = ngx_sprintf(v->data, "%ui", elapsed_ms) - v->data;
     } else {
         v->len = 0;
         v->data = (u_char *) "";
     }
 
     v->valid = 1;
-    v->no_cacheable = 1;
+    v->no_cacheable = 0;
     v->not_found = 0;
 
     return NGX_OK;
@@ -183,7 +180,6 @@ ngx_http_upstream_ntlm_create_conf(ngx_conf_t *cf) {
         return NULL;
     }
 
-    conf->timeout = NGX_CONF_UNSET_MSEC;
     return conf;
 }
 
@@ -208,7 +204,6 @@ ngx_http_upstream_init_ntlm(ngx_conf_t *cf, ngx_http_upstream_srv_conf_t *us) {
     ngx_http_upstream_ntlm_srv_conf_t *ncf;
 
     ncf = ngx_http_conf_upstream_srv_conf(us, ngx_http_upstream_ntlm_module);
-    ngx_conf_init_msec_value(ncf->timeout, 60000);
 
     if (ncf->original_init_upstream(cf, us) != NGX_OK) {
         return NGX_ERROR;
@@ -293,7 +288,7 @@ ngx_http_upstream_ntlm_client_cleanup(void *data) {
                        "ntlm: client dropped, closing pinned upstream %p", uc);
 
         ctx->upstream_conn = NULL;
-        ctx->is_pinned = 0;
+        ctx->pinned_time = 0;
 
         /*
          * Nullify the upstream's reference back to us before we close it,
@@ -318,7 +313,7 @@ ngx_http_upstream_ntlm_upstream_cleanup(void *data) {
     if (ctx) {
         ngx_log_debug1(NGX_LOG_DEBUG_HTTP, ngx_cycle->log, 0, "ntlm: upstream cleanup %p", ctx);
         ctx->upstream_conn = NULL;
-        ctx->is_pinned = 0;
+        ctx->pinned_time = 0;
     }
 }
 
@@ -371,7 +366,6 @@ ngx_http_upstream_init_ntlm_peer(ngx_http_request_t *r, ngx_http_upstream_srv_co
         return NGX_ERROR;
     }
     ngx_memzero(my_data, sizeof(ngx_http_upstream_ntlm_peer_data_t));
-    my_data->timeout = ncf->timeout;
 
     if (ncf->original_init_peer(r, us) != NGX_OK) {
         return NGX_ERROR;
@@ -422,7 +416,7 @@ ngx_http_upstream_get_ntlm_peer(ngx_peer_connection_t *pc, void *data) {
     ngx_http_upstream_ntlm_peer_data_t *my_data = data;
     ngx_connection_t *c;
 
-    if (my_data->ctx->is_pinned && my_data->ctx->upstream_conn != NULL) {
+    if (my_data->ctx->pinned_time && my_data->ctx->upstream_conn != NULL) {
         c = my_data->ctx->upstream_conn;
 
         c->idle = 0;
@@ -431,10 +425,6 @@ ngx_http_upstream_get_ntlm_peer(ngx_peer_connection_t *pc, void *data) {
         c->read->log = pc->log;
         c->write->log = pc->log;
         c->pool->log = pc->log;
-
-        if (c->read->timer_set) {
-            ngx_del_timer(c->read);
-        }
 
         pc->connection = c;
         pc->sockaddr = my_data->ctx->upstream_sockaddr;
@@ -496,7 +486,9 @@ ngx_http_upstream_free_ntlm_peer(ngx_peer_connection_t *pc, void *data, ngx_uint
 
     ctx->upstream_conn = c;
     pc->connection = NULL;
-    ctx->is_pinned = 1;
+    if(!ctx->pinned_time) {
+        ctx->pinned_time = ngx_current_msec;
+    }
 
     if (!my_data->cached) {
         ngx_log_debug1(NGX_LOG_DEBUG_HTTP, pc->log, 0,
@@ -542,15 +534,12 @@ ngx_http_upstream_free_ntlm_peer(ngx_peer_connection_t *pc, void *data, ngx_uint
 
     if (c->read->ready) {
         ngx_http_upstream_ntlm_upstream_close_handler(c->read);
-        return;
     }
-
-    ngx_add_timer(c->read, my_data->timeout);
     return;
 
 invalid:
     ctx->upstream_conn = NULL;
-    ctx->is_pinned = 0;
+    ctx->pinned_time = 0;
     if (!my_data->cached) {
         my_data->original_free_peer(pc, my_data->original_peer_data, state);
         my_data->original_peer_data = NULL;
@@ -619,7 +608,7 @@ close:
 
     if (ctx) {
         ctx->upstream_conn = NULL;
-        ctx->is_pinned = 0;
+        ctx->pinned_time = 0;
 
         /* Zero out addresses which are owned by the dying upstream for safety. */
         ctx->upstream_sockaddr = NULL;
