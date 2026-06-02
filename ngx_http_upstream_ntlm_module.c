@@ -13,12 +13,17 @@ typedef struct {
 
 /* Context representing the pinned state between a client and an upstream */
 typedef struct {
+    ngx_http_upstream_srv_conf_t *upstream_srv_conf;
     ngx_connection_t *upstream_conn;
     struct sockaddr *upstream_sockaddr;
     socklen_t upstream_socklen;
     ngx_str_t upstream_name;
     ngx_msec_t pinned_time;
 } ngx_http_upstream_ntlm_ctx_t;
+
+typedef struct {
+    ngx_http_upstream_srv_conf_t *us;
+} ngx_http_upstream_ntlm_req_ctx_t;
 
 typedef struct {
     ngx_http_upstream_ntlm_ctx_t *ctx;
@@ -50,7 +55,7 @@ static void ngx_http_upstream_ntlm_close_upstream(ngx_connection_t *c);
 static void ngx_http_upstream_ntlm_upstream_close_handler(ngx_event_t *ev);
 static void ngx_http_upstream_ntlm_dummy_handler(ngx_event_t *ev);
 
-static ngx_http_upstream_ntlm_ctx_t *ngx_http_upstream_ntlm_client_get_ctx(ngx_connection_t *c, ngx_flag_t create);
+static ngx_http_upstream_ntlm_ctx_t *ngx_http_upstream_ntlm_client_get_ctx(ngx_connection_t *c, ngx_http_upstream_srv_conf_t *us, ngx_flag_t create);
 static ngx_pool_cleanup_t *ngx_http_upstream_ntlm_get_upstream_cleanup(ngx_connection_t *c, ngx_flag_t create);
 
 static ngx_int_t ngx_http_upstream_ntlm_add_variables(ngx_conf_t *cf);
@@ -114,6 +119,8 @@ static ngx_int_t
 ngx_http_upstream_ntlm_pinned_var(ngx_http_request_t *r, ngx_http_variable_value_t *v, uintptr_t data) {
     ngx_connection_t *c;
     ngx_http_upstream_ntlm_ctx_t *ctx;
+    ngx_http_upstream_ntlm_req_ctx_t *rctx;
+    ngx_http_upstream_srv_conf_t *us = NULL;
 
 #if (NGX_HTTP_V2)
     if (r->stream) {
@@ -132,7 +139,16 @@ ngx_http_upstream_ntlm_pinned_var(ngx_http_request_t *r, ngx_http_variable_value
         return NGX_OK;
     }
 
-    ctx = ngx_http_upstream_ntlm_client_get_ctx(c, 0);
+    /* Try the cached value first, works at log phase too */
+    rctx = ngx_http_get_module_ctx(r, ngx_http_upstream_ntlm_module);
+    if (rctx) {
+        us = rctx->us;
+    } else if (r->upstream && r->upstream->upstream) {
+        /* Fallback: variable evaluated before init_peer ran */
+        us = r->upstream->upstream;
+    }
+
+    ctx = ngx_http_upstream_ntlm_client_get_ctx(c, us, 0);
 
     if (ctx != NULL && ctx->pinned_time != 0) {
         ngx_msec_t elapsed_ms = ngx_current_msec - ctx->pinned_time;
@@ -219,13 +235,16 @@ ngx_http_upstream_init_ntlm(ngx_conf_t *cf, ngx_http_upstream_srv_conf_t *us) {
 
 /* Get or Create the Context attached to the Client Connection */
 static ngx_http_upstream_ntlm_ctx_t *
-ngx_http_upstream_ntlm_client_get_ctx(ngx_connection_t *c, ngx_flag_t create) {
+ngx_http_upstream_ntlm_client_get_ctx(ngx_connection_t *c, ngx_http_upstream_srv_conf_t *us, ngx_flag_t create) {
     ngx_pool_cleanup_t *cln;
     ngx_http_upstream_ntlm_ctx_t *ctx;
 
     for (cln = c->pool->cleanup; cln; cln = cln->next) {
         if (cln->handler == ngx_http_upstream_ntlm_client_cleanup) {
-            return cln->data;
+            ctx = cln->data;
+            if (us == NULL || ctx->upstream_srv_conf == us) {
+                return ctx;
+            }
         }
     }
 
@@ -240,6 +259,7 @@ ngx_http_upstream_ntlm_client_get_ctx(ngx_connection_t *c, ngx_flag_t create) {
     ctx = (ngx_http_upstream_ntlm_ctx_t *)cln->data;
     ngx_memzero(ctx, sizeof(ngx_http_upstream_ntlm_ctx_t));
 
+    ctx->upstream_srv_conf = us;
     cln->handler = ngx_http_upstream_ntlm_client_cleanup;
     cln->data = ctx;
 
@@ -343,6 +363,7 @@ ngx_http_upstream_init_ntlm_peer(ngx_http_request_t *r, ngx_http_upstream_srv_co
     ngx_connection_t *c;
     ngx_http_upstream_ntlm_peer_data_t *my_data;
     ngx_http_upstream_ntlm_srv_conf_t *ncf;
+    ngx_http_upstream_ntlm_req_ctx_t *rctx;
     ngx_str_t auth_hdr;
     ngx_flag_t has_ntlm = 0;
 
@@ -358,6 +379,14 @@ ngx_http_upstream_init_ntlm_peer(ngx_http_request_t *r, ngx_http_upstream_srv_co
 #else
     c = r->connection;
 #endif
+
+    /* cache upstream for the request lifecycle */
+    rctx = ngx_palloc(r->pool, sizeof(ngx_http_upstream_ntlm_req_ctx_t));
+    if (rctx == NULL) {
+        return NGX_ERROR;
+    }
+    rctx->us = us;
+    ngx_http_set_ctx(r, rctx, ngx_http_upstream_ntlm_module);
 
     ncf = ngx_http_conf_upstream_srv_conf(us, ngx_http_upstream_ntlm_module);
 
@@ -382,7 +411,7 @@ ngx_http_upstream_init_ntlm_peer(ngx_http_request_t *r, ngx_http_upstream_srv_co
         }
     }
 
-    my_data->ctx = ngx_http_upstream_ntlm_client_get_ctx(c, has_ntlm);
+    my_data->ctx = ngx_http_upstream_ntlm_client_get_ctx(c, us, has_ntlm);
     if (my_data->ctx == NULL) {
         my_data->original_peer_data = r->upstream->peer.data;
         return NGX_OK;
