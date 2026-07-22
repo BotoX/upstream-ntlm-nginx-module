@@ -39,6 +39,7 @@ typedef struct {
 
 /* --- Function Prototypes --- */
 static void *ngx_http_upstream_ntlm_create_conf(ngx_conf_t *cf);
+static char *ngx_http_upstream_ntlm_init_main_conf(ngx_conf_t *cf, void *conf);
 static char *ngx_http_upstream_ntlm_directive(ngx_conf_t *cf, ngx_command_t *cmd, void *conf);
 static ngx_int_t ngx_http_upstream_init_ntlm(ngx_conf_t *cf, ngx_http_upstream_srv_conf_t *us);
 static ngx_int_t ngx_http_upstream_init_ntlm_peer(ngx_http_request_t *r, ngx_http_upstream_srv_conf_t *us);
@@ -92,7 +93,7 @@ static ngx_http_module_t ngx_http_upstream_ntlm_module_ctx = {
     ngx_http_upstream_ntlm_add_variables,     /* preconfiguration */
     ngx_http_upstream_ntlm_postconfiguration, /* postconfiguration */
     NULL,                                     /* create main configuration */
-    NULL,                                     /* init main configuration */
+    ngx_http_upstream_ntlm_init_main_conf,    /* init main configuration */
     ngx_http_upstream_ntlm_create_conf,       /* create server configuration */
     NULL,                                     /* merge server configuration */
     NULL,                                     /* create location configuration */
@@ -200,6 +201,34 @@ ngx_http_upstream_ntlm_create_conf(ngx_conf_t *cf) {
 }
 
 static char *
+ngx_http_upstream_ntlm_init_main_conf(ngx_conf_t *cf, void *conf)
+{
+    ngx_uint_t i;
+    ngx_http_upstream_main_conf_t *umcf;
+    ngx_http_upstream_srv_conf_t **uscfp;
+    ngx_http_upstream_ntlm_srv_conf_t *ncf;
+
+    umcf = ngx_http_conf_get_module_main_conf(cf, ngx_http_upstream_module);
+    uscfp = umcf->upstreams.elts;
+
+    for (i = 0; i < umcf->upstreams.nelts; i++) {
+        if (uscfp[i]->srv_conf == NULL) {
+            continue;
+        }
+
+        ncf = ngx_http_conf_upstream_srv_conf(uscfp[i], ngx_http_upstream_ntlm_module);
+        if (ncf->original_init_upstream == NULL) {
+            continue;
+        }
+
+        ncf->original_init_peer = uscfp[i]->peer.init;
+        uscfp[i]->peer.init = ngx_http_upstream_init_ntlm_peer;
+    }
+
+    return NGX_CONF_OK;
+}
+
+static char *
 ngx_http_upstream_ntlm_directive(ngx_conf_t *cf, ngx_command_t *cmd, void *conf) {
     ngx_http_upstream_srv_conf_t *uscf;
     ngx_http_upstream_ntlm_srv_conf_t *ncf = conf;
@@ -224,9 +253,6 @@ ngx_http_upstream_init_ntlm(ngx_conf_t *cf, ngx_http_upstream_srv_conf_t *us) {
     if (ncf->original_init_upstream(cf, us) != NGX_OK) {
         return NGX_ERROR;
     }
-
-    ncf->original_init_peer = us->peer.init;
-    us->peer.init = ngx_http_upstream_init_ntlm_peer;
 
     return NGX_OK;
 }
