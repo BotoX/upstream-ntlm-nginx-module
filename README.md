@@ -232,3 +232,17 @@ Both variables work in `log_format`, `proxy_set_header`, `map`, `if`, and OpenRe
   - HTTP/3 (QUIC) uses ephemeral per-stream connections and cannot sustain NTLM pinning. Do not enable `listen ... quic;` or advertise `Alt-Svc: h3` on NTLM-authenticated virtual hosts.
 - **Per-worker state:** Nginx worker processes do not share pin state; each client TCP connection is handled by a single worker for its entire lifetime.
 - **Verify configuration before reloading:** Always run `nginx -t` (or `openresty -t`) after installing or upgrading the module.
+
+---
+
+## Testing
+
+An end-to-end test suite is included in [tests/test_ntlm.py](tests/test_ntlm.py) (uses only Python stdlib + `openssl`). Run it after compiling against a new Nginx or OpenResty release:
+
+```bash
+python3 tests/test_ntlm.py \
+  --nginx /usr/local/openresty/nginx/sbin/nginx \
+  --module /usr/local/openresty/modules/ngx_http_upstream_ntlm_module.so
+```
+
+It verifies duplicate `ntlm;` rejection, HTTP/1.1 pinning lifecycle & client disconnect cleanup, credential switching teardown, upstream failover, `Connection: close`, `least_time` compatibility, HTTP/2 `GOAWAY`+`RST_STREAM` downgrade with zero connection leaks, `$ntlm_pinned_<upstream_name>` isolation, and clean error logs.
