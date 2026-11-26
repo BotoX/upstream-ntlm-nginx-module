@@ -11,6 +11,7 @@ Or via environment variables:
     python3 tests/test_ntlm.py
 """
 import argparse
+import base64
 import os
 import re
 import shutil
@@ -25,13 +26,24 @@ import time
 from concurrent.futures import ThreadPoolExecutor
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
+# Valid protocol-level test tokens (no external crypto dependencies required)
+NTLM_TYPE1 = base64.b64encode(b"NTLMSSP\x00\x01\x00\x00\x00\x00\x00\x00\x00").decode()
+NTLM_TYPE2 = base64.b64encode(b"NTLMSSP\x00\x02\x00\x00\x00\x00\x00\x00\x00").decode()
+NTLM_TYPE3 = base64.b64encode(b"NTLMSSP\x00\x03\x00\x00\x00\x00\x00\x00\x00").decode()
+SPNEGO_INIT = base64.b64encode(b"\x60\x06\x06\x04\x2b\x06\x01\x05").decode()
+SPNEGO_CHALLENGE = base64.b64encode(b"\xa1\x07\x30\x05\xa0\x03\x0a\x01\x01").decode()
+SPNEGO_RESP = base64.b64encode(b"\xa1\x08\x30\x06\xa2\x04\x04\x02\xaa\xbb").decode()
+SPNEGO_COMPLETE = base64.b64encode(b"\xa1\x07\x30\x05\xa0\x03\x0a\x01\x00").decode()
+
 
 class BackendServer:
-    def __init__(self, name, port):
+    def __init__(self, name, port, ssl_ctx=None):
         self.name = name
         self.port = port
+        self.ssl_ctx = ssl_ctx
         self.closed_ports = set()
         self.live_sockets = {}
+        self.authed_ports = {}
         self.lock = threading.Lock()
         self.server = None
         self.thread = None
@@ -102,6 +114,9 @@ class BackendServer:
                 peer_port = self.client_address[1]
                 auth = self.headers.get("Authorization", "")
                 pin_age = self.headers.get("X-NTLM-Pin-Age", "")
+                if auth:
+                    with parent.lock:
+                        parent.authed_ports[peer_port] = auth
                 body = f"backend={parent.name} port={peer_port} auth={auth} pin_age={pin_age}\n".encode()
 
                 if self.path == "/close":
@@ -113,10 +128,37 @@ class BackendServer:
                     self.close_connection = True
                     return
 
-                if self.path == "/ntlm":
-                    if auth.startswith("NTLM dHlwZTE"):
+                if self.path == "/next403":
+                    if parent.name == "B1":
+                        self.send_response(403)
+                        self.send_header("Content-Length", str(len(body)))
+                        self.end_headers()
+                        self.wfile.write(body)
+                        return
+
+                if self.path == "/spnego":
+                    if auth == f"Negotiate {SPNEGO_INIT}":
                         self.send_response(401)
-                        self.send_header("WWW-Authenticate", "NTLM dHlwZTI=")
+                        self.send_header(
+                            "WWW-Authenticate",
+                            f'Basic realm="corp, quoted \\"realm\\"", Negotiate {SPNEGO_CHALLENGE}',
+                        )
+                        self.send_header("Content-Length", str(len(body)))
+                        self.end_headers()
+                        self.wfile.write(body)
+                        return
+                    if auth == f"Negotiate {SPNEGO_RESP}":
+                        self.send_response(200)
+                        self.send_header("WWW-Authenticate", f"Negotiate {SPNEGO_COMPLETE}")
+                        self.send_header("Content-Length", str(len(body)))
+                        self.end_headers()
+                        self.wfile.write(body)
+                        return
+
+                if self.path in ("/ntlm", "/least_time", "/least_conn", "/ip_hash", "/sticky", "/tls"):
+                    if auth.startswith(f"NTLM {NTLM_TYPE1}") or auth.startswith(f"NTLM\t{NTLM_TYPE1}"):
+                        self.send_response(401)
+                        self.send_header("WWW-Authenticate", f"NTLM {NTLM_TYPE2}")
                         self.send_header("Content-Length", str(len(body)))
                         self.end_headers()
                         self.wfile.write(body)
@@ -130,6 +172,7 @@ class BackendServer:
             def finish(self):
                 with parent.lock:
                     parent.live_sockets.pop(self.client_address[1], None)
+                    parent.authed_ports.pop(self.client_address[1], None)
                     parent.closed_ports.add(self.client_address[1])
                 super().finish()
 
@@ -143,6 +186,8 @@ class BackendServer:
                 super().handle_error(request, client_address)
 
         self.server = ReusableThreadingHTTPServer(("127.0.0.1", self.port), Handler)
+        if self.ssl_ctx is not None:
+            self.server.socket = self.ssl_ctx.wrap_socket(self.server.socket, server_side=True)
         self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
         self.thread.start()
 
@@ -320,7 +365,7 @@ def run_tests(nginx_bin, ntlm_so):
         sub_path = os.path.join(workdir, sub)
         os.makedirs(sub_path, exist_ok=True)
         os.chmod(sub_path, 0o777)
-    b1 = b2 = None
+    b1 = b2 = b_tls = None
     nginx_proc = None
     try:
         cert_file = os.path.join(workdir, "cert.pem")
@@ -362,6 +407,12 @@ http {{
             workdir,
             "upstream lt_probe { least_time header inflight; ntlm; server 127.0.0.1:9; }",
         )
+        has_sticky = supports_directive(
+            nginx_bin,
+            ntlm_so,
+            workdir,
+            "upstream st_probe { zone st_z 64k; sticky cookie srv_id; ntlm; server 127.0.0.1:9; }",
+        )
         has_http2_directive = supports_directive(
             nginx_bin,
             ntlm_so,
@@ -372,14 +423,21 @@ http {{
 
         p_b1 = get_free_port()
         p_b2 = get_free_port()
+        p_tls = get_free_port()
         p_dead = get_free_port()
         p_http = get_free_port()
         p_https = get_free_port()
 
+        tls_ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+        tls_ctx.maximum_version = ssl.TLSVersion.TLSv1_2
+        tls_ctx.load_cert_chain(cert_file, key_file)
+
         b1 = BackendServer("B1", p_b1)
         b2 = BackendServer("B2", p_b2)
+        b_tls = BackendServer("BTLS", p_tls, ssl_ctx=tls_ctx)
         b1.start()
         b2.start()
+        b_tls.start()
 
         err_log = os.path.join(workdir, "error.log")
         acc_log = os.path.join(workdir, "access.log")
@@ -409,6 +467,31 @@ http {{
             if has_least_time
             else ""
         )
+        sticky_upstream = (
+            f"""
+    upstream sticky_pool {{
+        zone sticky_zone 64k;
+        sticky cookie srv_id;
+        ntlm;
+        keepalive 8;
+        server 127.0.0.1:{p_b1};
+        server 127.0.0.1:{p_b2};
+    }}
+"""
+            if has_sticky
+            else ""
+        )
+        sticky_location = (
+            """
+        location /sticky {
+            proxy_pass http://sticky_pool;
+            proxy_http_version 1.1;
+            proxy_set_header Connection "";
+        }
+"""
+            if has_sticky
+            else ""
+        )
 
         with open(conf_file, "w") as f:
             f.write(f"""
@@ -418,7 +501,7 @@ pid {pid_file};
 error_log {err_log} debug;
 
 events {{
-    worker_connections 64;
+    worker_connections 128;
 }}
 
 http {{
@@ -435,12 +518,41 @@ http {{
         keepalive 8;
     }}
 
+    upstream next403_pool {{
+        ntlm;
+        server 127.0.0.1:{p_b1};
+        server 127.0.0.1:{p_b2};
+        keepalive 8;
+    }}
+
+    upstream least_conn_pool {{
+        ntlm;
+        least_conn;
+        keepalive 8;
+        server 127.0.0.1:{p_b1};
+        server 127.0.0.1:{p_b2};
+    }}
+
+    upstream ip_hash_pool {{
+        ntlm;
+        ip_hash;
+        server 127.0.0.1:{p_b1};
+        server 127.0.0.1:{p_b2};
+    }}
+
+    upstream tls_pool {{
+        zone tls_zone 64k;
+        ntlm;
+        keepalive 8;
+        server 127.0.0.1:{p_tls};
+    }}
+
     upstream failover_pool {{
         ntlm;
         server 127.0.0.1:{p_dead};
         server 127.0.0.1:{p_b1};
     }}
-{least_time_upstream}
+{least_time_upstream}{sticky_upstream}
     upstream owa_pool {{
         ntlm;
         server 127.0.0.1:{p_b2};
@@ -457,6 +569,54 @@ http {{
             proxy_set_header X-NTLM-Pin-Age $early_pin;
         }}
 
+        location /msx_unbuffered {{
+            set $p_ex $ntlm_pinned_ntlm_pool;
+            proxy_pass http://ntlm_pool;
+            proxy_http_version 1.1;
+            proxy_set_header Connection "";
+            proxy_request_buffering off;
+            proxy_set_header X-NTLM-Pin-Age $p_ex;
+        }}
+
+        location /ip_hash {{
+            proxy_pass http://ip_hash_pool;
+            proxy_http_version 1.1;
+            proxy_set_header Connection "";
+            proxy_set_header X-NTLM-Pin-Age $ntlm_pinned;
+        }}
+
+        location /spnego {{
+            set $early_pin $ntlm_pinned;
+            proxy_pass http://ntlm_pool;
+            proxy_http_version 1.1;
+            proxy_set_header Connection "";
+            proxy_set_header X-NTLM-Pin-Age $early_pin;
+        }}
+
+        location /next403 {{
+            proxy_pass http://next403_pool;
+            proxy_http_version 1.1;
+            proxy_set_header Connection "";
+            proxy_next_upstream http_403;
+        }}
+
+        location /least_conn {{
+            proxy_pass http://least_conn_pool;
+            proxy_http_version 1.1;
+            proxy_set_header Connection "";
+            proxy_set_header X-NTLM-Pin-Age $ntlm_pinned;
+        }}
+
+        location /tls {{
+            proxy_pass https://tls_pool;
+            proxy_http_version 1.1;
+            proxy_set_header Connection "";
+            proxy_ssl_protocols TLSv1.2;
+            proxy_ssl_session_reuse on;
+            proxy_ssl_verify off;
+            proxy_set_header X-NTLM-Pin-Age $ntlm_pinned;
+        }}
+
         location /close {{
             proxy_pass http://ntlm_pool;
             proxy_http_version 1.1;
@@ -469,7 +629,7 @@ http {{
             proxy_http_version 1.1;
             proxy_set_header Connection "";
         }}
-{least_time_location}
+{least_time_location}{sticky_location}
         location /owa {{
             set $p_owa $ntlm_pinned_owa_pool;
             set $p_ex  $ntlm_pinned_ntlm_pool;
@@ -518,12 +678,12 @@ http {{
         d_foo = parse_body(body)
         assert st == 200 and d_foo["pin_age"] == "", f"'NTLMfoo' should not pin: {d_foo}"
 
-        st, body = raw_http1_exchange(sock, "/ntlm", {"Authorization": "NTLM dHlwZTE="})
+        st, body = raw_http1_exchange(sock, "/ntlm", {"Authorization": f"NTLM {NTLM_TYPE1}"})
         d1 = parse_body(body)
         assert st == 401, f"Expected 401 on Type 1, got {st}"
 
         time.sleep(0.02)
-        st, body = raw_http1_exchange(sock, "/ntlm", {"Authorization": "NTLM dHlwZTM="})
+        st, body = raw_http1_exchange(sock, "/ntlm", {"Authorization": f"NTLM {NTLM_TYPE3}"})
         d2 = parse_body(body)
         assert st == 200, f"Expected 200 on Type 3, got {st}"
         assert d2["backend"] == d1["backend"] and d2["port"] == d1["port"], f"Pin broken! r1={d1}, r2={d2}"
@@ -551,7 +711,7 @@ http {{
 
         # --- Test 3: Credential switching (Basic on pinned NTLM conn) tears down pin ---
         sock = socket.create_connection(("127.0.0.1", p_http), timeout=5)
-        st, body = raw_http1_exchange(sock, "/ntlm", {"Authorization": "NTLM dHlwZTE="})
+        st, body = raw_http1_exchange(sock, "/ntlm", {"Authorization": f"NTLM {NTLM_TYPE1}"})
         p1 = parse_body(body)
         st, body = raw_http1_exchange(sock, "/ntlm", {"Authorization": "Basic dXNlcjpwYXNz"})
         p2 = parse_body(body)
@@ -565,7 +725,7 @@ http {{
         # --- Test 4: Upstream failover (proxy_next_upstream) ---
         sock = socket.create_connection(("127.0.0.1", p_http), timeout=5)
         for _ in range(3):
-            st, body = raw_http1_exchange(sock, "/failover", {"Authorization": "NTLM dHlwZTE="})
+            st, body = raw_http1_exchange(sock, "/failover", {"Authorization": f"NTLM {NTLM_TYPE1}"})
             assert st == 200, f"Failover failed with status {st}"
         sock.close()
         assert nginx_proc.poll() is None, "Nginx crashed during failover!"
@@ -573,10 +733,10 @@ http {{
 
         # --- Test 5: Connection: close (u->keepalive == 0) is NOT pinned ---
         sock = socket.create_connection(("127.0.0.1", p_http), timeout=5)
-        st, body = raw_http1_exchange(sock, "/close", {"Authorization": "NTLM dHlwZTE="})
+        st, body = raw_http1_exchange(sock, "/close", {"Authorization": f"NTLM {NTLM_TYPE1}"})
         c1 = parse_body(body)
         assert st == 200
-        st, body = raw_http1_exchange(sock, "/ntlm", {"Authorization": "NTLM dHlwZTM="})
+        st, body = raw_http1_exchange(sock, "/ntlm", {"Authorization": f"NTLM {NTLM_TYPE3}"})
         c2 = parse_body(body)
         assert st == 200, f"Expected 200 after Connection: close, got {st}"
         assert c2["port"] != c1["port"] or c2["backend"] != c1["backend"], "Closing backend socket was mistakenly pinned!"
@@ -586,10 +746,10 @@ http {{
         # --- Test 6: least_time header inflight + ntlm (peer.notify wrapper) ---
         if has_least_time:
             sock = socket.create_connection(("127.0.0.1", p_http), timeout=5)
-            st, body = raw_http1_exchange(sock, "/least_time", {"Authorization": "NTLM dHlwZTE="})
+            st, body = raw_http1_exchange(sock, "/least_time", {"Authorization": f"NTLM {NTLM_TYPE1}"})
             lt1 = parse_body(body)
-            assert st == 200
-            st, body = raw_http1_exchange(sock, "/least_time", {"Authorization": "NTLM dHlwZTM="})
+            assert st == 401
+            st, body = raw_http1_exchange(sock, "/least_time", {"Authorization": f"NTLM {NTLM_TYPE3}"})
             lt2 = parse_body(body)
             assert st == 200 and lt2["backend"] == lt1["backend"] and lt2["port"] == lt1["port"], (
                 f"least_time pin mismatch: {lt1} vs {lt2}"
@@ -613,7 +773,7 @@ http {{
         )
 
         for i in range(70):
-            frames_ntlm = send_h2_request(p_https, "/ntlm", auth_header="NTLM dHlwZTE=")
+            frames_ntlm = send_h2_request(p_https, "/ntlm", auth_header=f"NTLM {NTLM_TYPE1}")
             goaways = [f for f in frames_ntlm if f[0] == 0x7]
             rsts = [f for f in frames_ntlm if f[0] == 0x3 and f[2] == 1]
             assert goaways, f"Iter {i}: Expected GOAWAY frame, got {frames_ntlm}"
@@ -625,7 +785,7 @@ http {{
 
         # --- Test 8: Prefix variable $ntlm_pinned_<upstream_name> isolation ---
         sock = socket.create_connection(("127.0.0.1", p_http), timeout=5)
-        st, body = raw_http1_exchange(sock, "/owa", {"Authorization": "Negotiate dGlja2V0MQ=="})
+        st, body = raw_http1_exchange(sock, "/owa", {"Authorization": f"Negotiate {SPNEGO_INIT}"})
         m1 = parse_body(body)
         assert st == 200 and m1["pin_age"] == "|", f"Expected both unpinned before first req, got {m1}"
 
@@ -635,7 +795,7 @@ http {{
         owa_age, ex_age = m2["pin_age"].split("|")
         assert st == 200 and owa_age.isdigit() and ex_age == "", f"Expected owa pinned & ex unpinned, got {m2}"
 
-        st, body = raw_http1_exchange(sock, "/ex", {"Authorization": "Negotiate dGlja2V0Mg=="})
+        st, body = raw_http1_exchange(sock, "/ex", {"Authorization": f"Negotiate {SPNEGO_INIT}"})
         assert st == 200
 
         time.sleep(0.02)
@@ -651,11 +811,11 @@ http {{
         def concurrent_client(cid):
             s = socket.create_connection(("127.0.0.1", p_http), timeout=5)
             try:
-                st1, b1_resp = raw_http1_exchange(s, "/ntlm", {"Authorization": f"NTLM dHlwZTE={cid}"})
+                st1, b1_resp = raw_http1_exchange(s, "/ntlm", {"Authorization": f"NTLM {NTLM_TYPE1}"})
                 r1 = parse_body(b1_resp)
                 assert st1 == 401
                 time.sleep(0.01 * (cid % 5))
-                st2, b2_resp = raw_http1_exchange(s, "/ntlm", {"Authorization": f"NTLM dHlwZTM={cid}"})
+                st2, b2_resp = raw_http1_exchange(s, "/ntlm", {"Authorization": f"NTLM {NTLM_TYPE3}"})
                 r2 = parse_body(b2_resp)
                 assert st2 == 200 and r2["backend"] == r1["backend"] and r2["port"] == r1["port"]
                 for _ in range(4):
@@ -672,25 +832,28 @@ http {{
         assert len(set(endpoints)) == 20, f"Two concurrent clients shared a pinned backend socket! {endpoints}"
         print("[PASS] Test 9: 20 concurrent NTLM clients maintained strict 1:1 backend isolation (0 cross-talk)")
 
-        # --- Test 10: Backend-initiated idle close recovery ---
+        # --- Test 10: Backend-initiated idle close recovery + no anonymous re-pin ---
         sock = socket.create_connection(("127.0.0.1", p_http), timeout=5)
-        st, body = raw_http1_exchange(sock, "/ntlm", {"Authorization": "Negotiate dGlja2V0X2lkbGU="})
+        st, body = raw_http1_exchange(sock, "/ntlm", {"Authorization": f"Negotiate {SPNEGO_INIT}"})
         idle1 = parse_body(body)
         assert st == 200
         pinned_be = b1 if idle1["backend"] == "B1" else b2
         pinned_be.force_close_peer(idle1["port"])
         time.sleep(0.15)
-        # Next request on same client socket must see cleared pin and open a fresh backend socket cleanly
+        # Next anonymous request must see cleared pin and NOT re-pin
         st, body = raw_http1_exchange(sock, "/ntlm")
         idle2 = parse_body(body)
         assert st == 200 and idle2["pin_age"] == "", f"Expected cleared pin after backend idle close, got {idle2}"
         assert (idle2["backend"], idle2["port"]) != (idle1["backend"], idle1["port"])
+        st, body = raw_http1_exchange(sock, "/ntlm")
+        idle3 = parse_body(body)
+        assert st == 200 and idle3["pin_age"] == "", f"Anonymous follow-up mistakenly re-pinned! got {idle3}"
         sock.close()
-        print("[PASS] Test 10: Backend idle disconnect cleanly invalidated pin & recovered without 502")
+        print("[PASS] Test 10: Backend idle disconnect invalidated pin, recovered without 502, and did not re-pin anonymous follow-ups")
 
         # --- Test 11: Unsolicited bytes on idle pinned socket (MSG_PEEK drops dirty socket) ---
         sock = socket.create_connection(("127.0.0.1", p_http), timeout=5)
-        st, body = raw_http1_exchange(sock, "/ntlm", {"Authorization": "Negotiate dGlja2V0X3BlZWs="})
+        st, body = raw_http1_exchange(sock, "/ntlm", {"Authorization": f"Negotiate {SPNEGO_INIT}"})
         pk1 = parse_body(body)
         assert st == 200
         pinned_be = b1 if pk1["backend"] == "B1" else b2
@@ -700,12 +863,15 @@ http {{
         st, body = raw_http1_exchange(sock, "/ntlm")
         pk2 = parse_body(body)
         assert st == 200 and pk2["pin_age"] == "", f"Expected clean unpinned recovery after MSG_PEEK drop, got {pk2}"
+        st, body = raw_http1_exchange(sock, "/ntlm")
+        pk3 = parse_body(body)
+        assert st == 200 and pk3["pin_age"] == "", f"Anonymous follow-up after MSG_PEEK drop re-pinned! got {pk3}"
         sock.close()
-        print("[PASS] Test 11: Unsolicited bytes on idle pinned socket triggered MSG_PEEK teardown & clean recovery")
+        print("[PASS] Test 11: Unsolicited bytes on idle pinned socket triggered MSG_PEEK teardown & clean unpinned recovery")
 
         # --- Test 12: Abrupt client TCP RST mid-handshake closes backend socket ---
         sock = socket.create_connection(("127.0.0.1", p_http), timeout=5)
-        st, body = raw_http1_exchange(sock, "/ntlm", {"Authorization": "NTLM dHlwZTE="})
+        st, body = raw_http1_exchange(sock, "/ntlm", {"Authorization": f"NTLM {NTLM_TYPE1}"})
         rst1 = parse_body(body)
         assert st == 401
         # Force immediate TCP RST on close
@@ -718,7 +884,7 @@ http {{
 
         # --- Test 13: Chunked POST over pinned NTLM connection ---
         sock = socket.create_connection(("127.0.0.1", p_http), timeout=5)
-        st, body = raw_http1_exchange(sock, "/ntlm", {"Authorization": "Negotiate dGlja2V0X3Bvc3Q="})
+        st, body = raw_http1_exchange(sock, "/ntlm", {"Authorization": f"Negotiate {SPNEGO_INIT}"})
         cp1 = parse_body(body)
         assert st == 200
         payload_chunk = b"X" * 16384
@@ -752,7 +918,7 @@ http {{
 
         # --- Test 14: HTTP/1.0 (non-keepalive) NTLM client does not leak backend socket ---
         sock = socket.create_connection(("127.0.0.1", p_http), timeout=5)
-        sock.sendall(b"GET /ntlm HTTP/1.0\r\nHost: localhost\r\nAuthorization: Negotiate dGlja2V0MTA=\r\n\r\n")
+        sock.sendall(f"GET /ntlm HTTP/1.0\r\nHost: localhost\r\nAuthorization: Negotiate {SPNEGO_INIT}\r\n\r\n".encode())
         resp10 = b""
         while True:
             chunk = sock.recv(4096)
@@ -767,16 +933,222 @@ http {{
         assert h10["port"] in pinned_be.closed_ports, "HTTP/1.0 client leaked pinned backend socket!"
         print("[PASS] Test 14: HTTP/1.0 non-keepalive NTLM request closed backend socket cleanly")
 
-        # --- Test 15: Zero worker crashes / alerts / emergs ---
+        # --- Test 15: proxy_next_upstream http_403 (NGX_PEER_NEXT) does not leak NTLM socket to shared keepalive ---
+        b1_before = set(b1.closed_ports)
+        sock = socket.create_connection(("127.0.0.1", p_http), timeout=5)
+        st, body = raw_http1_exchange(sock, "/next403", {"Authorization": f"NTLM {NTLM_TYPE1}"})
+        nx1 = parse_body(body)
+        assert st == 200 and nx1["backend"] == "B2", f"Expected failover from B1(403) to B2(200), got st={st}, {nx1}"
+        time.sleep(0.15)
+        b1_closed_now = b1.closed_ports - b1_before
+        assert b1_closed_now, "B1 NTLM socket rejected via NGX_PEER_NEXT was NOT closed (leaked into shared keepalive)!"
+        # Anonymous stranger hitting /next403 must never land on an NTLM-authenticated B1 socket
+        stranger = socket.create_connection(("127.0.0.1", p_http), timeout=5)
+        st, body = raw_http1_exchange(stranger, "/ntlm")
+        s_resp = parse_body(body)
+        assert st == 200 and s_resp["port"] not in b1.authed_ports, (
+            f"Anonymous stranger inherited an authenticated socket! {s_resp}"
+        )
+        sock.close()
+        stranger.close()
+        print("[PASS] Test 15: NGX_PEER_NEXT (http_403) closed rejected NTLM socket without leaking to shared keepalive")
+
+        # --- Test 16: Protocol-aware re-authentication, scheme switch, and SPNEGO continuation ---
+        sock = socket.create_connection(("127.0.0.1", p_http), timeout=5)
+        # Complete NTLM handshake with tab delimiter
+        st, body = raw_http1_exchange(sock, "/ntlm", {"Authorization": f"NTLM\t{NTLM_TYPE1}"})
+        pr1 = parse_body(body)
+        assert st == 401
+        st, body = raw_http1_exchange(sock, "/ntlm", {"Authorization": f"NTLM {NTLM_TYPE3}"})
+        pr2 = parse_body(body)
+        assert st == 200 and (pr2["backend"], pr2["port"]) == (pr1["backend"], pr1["port"])
+        # Unsolicited Type-3 after completion must retire old socket
+        st, body = raw_http1_exchange(sock, "/ntlm", {"Authorization": f"NTLM {NTLM_TYPE3}"})
+        pr3 = parse_body(body)
+        assert st == 200 and (pr3["backend"], pr3["port"]) != (pr2["backend"], pr2["port"]), (
+            f"Unsolicited Type-3 reused completed socket! {pr2} vs {pr3}"
+        )
+        # New Type-1 must retire previous socket
+        st, body = raw_http1_exchange(sock, "/ntlm", {"Authorization": f"NTLM {NTLM_TYPE1}"})
+        pr4 = parse_body(body)
+        assert st == 401 and (pr4["backend"], pr4["port"]) != (pr3["backend"], pr3["port"]), (
+            f"New Type-1 reused previous socket! {pr3} vs {pr4}"
+        )
+        # Switching from NTLM to Negotiate must retire NTLM socket and run 2-step SPNEGO
+        st, body = raw_http1_exchange(sock, "/spnego", {"Authorization": f"Negotiate {SPNEGO_INIT}"})
+        sp1 = parse_body(body)
+        assert st == 401 and (sp1["backend"], sp1["port"]) != (pr4["backend"], pr4["port"])
+        st, body = raw_http1_exchange(sock, "/spnego", {"Authorization": f"Negotiate {SPNEGO_RESP}"})
+        sp2 = parse_body(body)
+        assert st == 200 and (sp2["backend"], sp2["port"]) == (sp1["backend"], sp1["port"]), (
+            f"SPNEGO continuation broke pin! {sp1} vs {sp2}"
+        )
+        # Replaying SPNEGO response after accept-completed must retire socket
+        st, body = raw_http1_exchange(sock, "/spnego", {"Authorization": f"Negotiate {SPNEGO_RESP}"})
+        sp3 = parse_body(body)
+        assert st == 200 and (sp3["backend"], sp3["port"]) != (sp2["backend"], sp2["port"]), (
+            f"Replayed SPNEGO response reused completed socket! {sp2} vs {sp3}"
+        )
+        sock.close()
+        print("[PASS] Test 16: Protocol-aware Type-1 restart, scheme switch, tab OWS, and SPNEGO DER continuation verified")
+
+        # --- Test 17: ntlm; before least_conn; + keepalive directive order independence ---
+        sock = socket.create_connection(("127.0.0.1", p_http), timeout=5)
+        st, body = raw_http1_exchange(sock, "/least_conn", {"Authorization": f"NTLM {NTLM_TYPE1}"})
+        lc1 = parse_body(body)
+        assert st == 401
+        st, body = raw_http1_exchange(sock, "/least_conn", {"Authorization": f"NTLM {NTLM_TYPE3}"})
+        lc2 = parse_body(body)
+        assert st == 200 and (lc2["backend"], lc2["port"]) == (lc1["backend"], lc1["port"]), (
+            f"ntlm before least_conn broke pin! {lc1} vs {lc2}"
+        )
+        st, body = raw_http1_exchange(sock, "/least_conn")
+        lc3 = parse_body(body)
+        assert st == 200 and (lc3["backend"], lc3["port"]) == (lc1["backend"], lc1["port"])
+        sock.close()
+        print("[PASS] Test 17: 'ntlm;' placed before 'least_conn;' and 'keepalive' preserved pinning")
+
+        # --- Test 18: HTTPS upstream with zone + proxy_ssl_session_reuse on ---
+        sock = socket.create_connection(("127.0.0.1", p_http), timeout=5)
+        st, body = raw_http1_exchange(sock, "/tls", {"Authorization": f"NTLM {NTLM_TYPE1}"})
+        tl1 = parse_body(body)
+        assert st == 401 and tl1["backend"] == "BTLS"
+        st, body = raw_http1_exchange(sock, "/tls", {"Authorization": f"NTLM {NTLM_TYPE3}"})
+        tl2 = parse_body(body)
+        assert st == 200 and tl2["port"] == tl1["port"], f"HTTPS upstream pin broke! {tl1} vs {tl2}"
+        # Anonymous client must use a separate TLS connection
+        stranger = socket.create_connection(("127.0.0.1", p_http), timeout=5)
+        st, body = raw_http1_exchange(stranger, "/tls")
+        tl_anon = parse_body(body)
+        assert st == 200 and tl_anon["port"] != tl1["port"], "Anonymous client shared TLS NTLM socket!"
+        sock.close()
+        stranger.close()
+        time.sleep(0.2)
+        assert tl1["port"] in b_tls.closed_ports, "TLS pinned backend socket was NOT closed on client disconnect!"
+        print("[PASS] Test 18: HTTPS upstream (zone + proxy_ssl_session_reuse on) pinned, isolated, and closed cleanly")
+
+        # --- Test 19: msxproxy unbuffered POST + zero-sleep backend close race on $ntlm_pinned_<upstream> ---
+        for _ in range(10):
+            sock = socket.create_connection(("127.0.0.1", p_http), timeout=5)
+            st, body = raw_http1_exchange(sock, "/msx_unbuffered", {"Authorization": f"Negotiate {SPNEGO_INIT}"})
+            ub1 = parse_body(body)
+            assert st == 200
+            pinned_be = b1 if ub1["backend"] == "B1" else b2
+            # Close backend socket and IMMEDIATELY (no sleep!) send POST with proxy_request_buffering off
+            pinned_be.force_close_peer(ub1["port"])
+            post_payload = b"<EWS/>"
+            raw_post = (
+                b"POST /msx_unbuffered HTTP/1.1\r\n"
+                b"Host: localhost\r\n"
+                b"Connection: keep-alive\r\n"
+                b"Authorization: \r\n"
+                + f"Content-Length: {len(post_payload)}\r\n\r\n".encode()
+                + post_payload
+            )
+            sock.sendall(raw_post)
+            buf = b""
+            while b"\r\n\r\n" not in buf:
+                buf += sock.recv(4096)
+            head, rest = buf.split(b"\r\n\r\n", 1)
+            post_st = int(head.decode("latin1").split("\r\n")[0].split()[1])
+            cl = next(
+                int(l.split(":", 1)[1].strip())
+                for l in head.decode("latin1").split("\r\n")[1:]
+                if l.lower().startswith("content-length:")
+            )
+            while len(rest) < cl:
+                rest += sock.recv(4096)
+            post_body = rest[:cl].decode()
+            assert post_st == 200, f"Unbuffered POST hit 502 on backend-close race: st={post_st}, body={post_body!r}"
+            assert "pin_age= body_len=6" in post_body, (
+                f"Expected $ntlm_pinned_ntlm_pool='' via MSG_PEEK liveness check, got {post_body!r}"
+            )
+            sock.close()
+        print("[PASS] Test 19: Unbuffered POST (msxproxy flow) survived 10 zero-sleep backend-close races with 0 502s")
+
+        # --- Test 20: Multi-upstream unprefixed $ntlm_pinned skips unpinned ctx to find active pin ---
+        sock = socket.create_connection(("127.0.0.1", p_http), timeout=5)
+        st, body = raw_http1_exchange(sock, "/owa", {"Authorization": f"Negotiate {SPNEGO_INIT}"})
+        mu_owa = parse_body(body)
+        assert st == 200
+        st, body = raw_http1_exchange(sock, "/ntlm", {"Authorization": f"Negotiate {SPNEGO_INIT}"})
+        mu_ex = parse_body(body)
+        assert st == 200
+        # Drop owa_pool's backend socket while ntlm_pool stays pinned
+        b2.force_close_peer(mu_owa["port"])
+        time.sleep(0.05)
+        st, body = raw_http1_exchange(sock, "/ntlm", {"Authorization": "   "})
+        mu_check = parse_body(body)
+        assert st == 200 and mu_check["pin_age"].isdigit(), (
+            f"Unprefixed $ntlm_pinned missed active pin or whitespace-only Authorization broke pin: {mu_check}"
+        )
+        assert (mu_check["backend"], mu_check["port"]) == (mu_ex["backend"], mu_ex["port"])
+        sock.close()
+        print("[PASS] Test 20: Unprefixed $ntlm_pinned skipped dropped upstream ctx & preserved whitespace-only Authorization")
+
+        # --- Test 21: Token68 Base64 '=' padding smuggling & SPNEGO negState=reject+payload rejected ---
+        sock = socket.create_connection(("127.0.0.1", p_http), timeout=5)
+        st, body = raw_http1_exchange(sock, "/ntlm", {"Authorization": f"NTLM {NTLM_TYPE1}"})
+        sm1 = parse_body(body)
+        assert st == 401
+        # Pad valid NTLM Type-3 with '=' followed by smuggled garbage (ngx_decode_base64 stops at '=')
+        raw_t3_padded = base64.b64encode(b"NTLMSSP\x00\x03\x00\x00\x00\xaa").decode()  # ends with '=='
+        assert raw_t3_padded.endswith("==")
+        smuggled_t3 = raw_t3_padded[:-1] + "X"  # '=' followed by non-'='
+        st, body = raw_http1_exchange(sock, "/ntlm", {"Authorization": f"NTLM {smuggled_t3}"})
+        sm2 = parse_body(body)
+        assert (sm2["backend"], sm2["port"]) != (sm1["backend"], sm1["port"]), (
+            f"Smuggled Base64 padding reused pending challenge socket! {sm1} vs {sm2}"
+        )
+        # SPNEGO NegTokenResp with negState=reject(2) + responseToken must NOT continue pending SPNEGO challenge
+        st, body = raw_http1_exchange(sock, "/spnego", {"Authorization": f"Negotiate {SPNEGO_INIT}"})
+        rj1 = parse_body(body)
+        assert st == 401
+        spnego_reject_with_payload = base64.b64encode(
+            b"\xa1\x0d\x30\x0b\xa0\x03\x0a\x01\x02\xa2\x04\x04\x02\xaa\xbb"
+        ).decode()
+        st, body = raw_http1_exchange(sock, "/spnego", {"Authorization": f"Negotiate {spnego_reject_with_payload}"})
+        rj2 = parse_body(body)
+        assert (rj2["backend"], rj2["port"]) != (rj1["backend"], rj1["port"]), (
+            f"SPNEGO negState=reject+payload reused pending challenge socket! {rj1} vs {rj2}"
+        )
+        sock.close()
+        print("[PASS] Test 21: Base64 '=' padding smuggling & SPNEGO negState=reject+payload cleanly rejected")
+
+        # --- Test 22: ip_hash + ntlm (msxproxy exchange_upstream) & sticky cookie + ntlm compatibility ---
+        sock = socket.create_connection(("127.0.0.1", p_http), timeout=5)
+        st, body = raw_http1_exchange(sock, "/ip_hash", {"Authorization": f"NTLM {NTLM_TYPE1}"})
+        ih1 = parse_body(body)
+        assert st == 401
+        st, body = raw_http1_exchange(sock, "/ip_hash", {"Authorization": f"NTLM {NTLM_TYPE3}"})
+        ih2 = parse_body(body)
+        assert st == 200 and (ih2["backend"], ih2["port"]) == (ih1["backend"], ih1["port"])
+        sock.close()
+        if has_sticky:
+            sock = socket.create_connection(("127.0.0.1", p_http), timeout=5)
+            st, body = raw_http1_exchange(sock, "/sticky", {"Authorization": f"NTLM {NTLM_TYPE1}"})
+            sk1 = parse_body(body)
+            assert st == 401
+            # Omit sticky cookie on Type-3 — NTLM pin must still hold on the same backend socket
+            st, body = raw_http1_exchange(sock, "/sticky", {"Authorization": f"NTLM {NTLM_TYPE3}"})
+            sk2 = parse_body(body)
+            assert st == 200 and (sk2["backend"], sk2["port"]) == (sk1["backend"], sk1["port"])
+            sock.close()
+            print("[PASS] Test 22: 'ip_hash + ntlm' and 'sticky cookie + ntlm' pinned cleanly")
+        else:
+            print("[PASS] Test 22: 'ip_hash + ntlm' pinned cleanly (sticky directive not supported by binary)")
+
+        # --- Test 23: Zero worker crashes / alerts / emergs / config warnings ---
         time.sleep(0.2)
         err_text = open(err_log).read()
-        assert "signal" not in err_text.lower() and "[emerg]" not in err_text.lower() and "[alert]" not in err_text.lower(), (
-            "Unexpected critical error in error.log:\n"
-            + "\n".join(l for l in err_text.splitlines() if any(k in l.lower() for k in ("signal", "[emerg]", "[alert]")))
-        )
-        print("[PASS] Test 15: Zero [alert], [emerg], or worker crashes in error.log")
+        bad_lines = [
+            l for l in err_text.splitlines()
+            if any(k in l.lower() for k in ("signal", "[emerg]", "[alert]", "redefined"))
+        ]
+        assert not bad_lines, "Unexpected error/warning in error.log:\n" + "\n".join(bad_lines)
+        print("[PASS] Test 23: Zero [alert], [emerg], balancer warnings, or worker crashes in error.log")
 
-        print("\nALL 15 NTLM MODULE TESTS PASSED!")
+        print("\nALL 23 NTLM MODULE TESTS PASSED!")
     finally:
         if nginx_proc:
             nginx_proc.terminate()
@@ -788,6 +1160,8 @@ http {{
             b1.stop()
         if b2:
             b2.stop()
+        if b_tls:
+            b_tls.stop()
         shutil.rmtree(workdir, ignore_errors=True)
 
 

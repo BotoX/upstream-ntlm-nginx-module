@@ -23,7 +23,7 @@ This module pins an upstream TCP connection to the client's TCP connection when 
 
 - **Nginx** ≥ 1.11.5 (tested up to Nginx 1.31.10) **or OpenResty**
 - Build tools (`gcc`, `make`) and development libraries matching your installation (`pcre2`/`pcre`, `openssl`, `zlib`)
-- Optional: `--with-http_ssl_module` for TLS upstreams
+- `--with-http_ssl_module` (required for `--with-compat` dynamic modules and TLS upstreams)
 - Optional: `--with-http_v2_module` for HTTP/2 → HTTP/1.1 downgrade support
 
 > [!IMPORTANT]
@@ -245,4 +245,4 @@ python3 tests/test_ntlm.py \
   --module /usr/local/openresty/modules/ngx_http_upstream_ntlm_module.so
 ```
 
-It verifies duplicate `ntlm;` rejection, HTTP/1.1 pinning lifecycle & client disconnect cleanup, credential switching teardown, upstream failover, `Connection: close`, `least_time` compatibility, HTTP/2 `GOAWAY`+`RST_STREAM` downgrade with zero connection leaks, `$ntlm_pinned_<upstream_name>` isolation, and clean error logs.
+It verifies duplicate `ntlm;` rejection, HTTP/1.1 pinning lifecycle & client disconnect cleanup, protocol-aware NTLM/SPNEGO continuation & re-authentication teardown, RFC 9110 `token68` Base64 padding & SPNEGO `negState` validation, credential switching teardown, upstream failover, `NGX_PEER_NEXT` (`http_403`) shared-keepalive isolation, unbuffered `POST` idle-socket liveness checks, `Connection: close`, `least_conn` / `ip_hash` / `sticky` / `least_time` compatibility, HTTPS upstreams (`proxy_ssl_session_reuse on`), HTTP/2 `GOAWAY`+`RST_STREAM` downgrade with zero connection leaks, `$ntlm_pinned` / `$ntlm_pinned_<upstream_name>` isolation, and clean error logs.

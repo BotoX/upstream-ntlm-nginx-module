@@ -5,10 +5,30 @@
 #include <ngx_http_v2.h>
 #endif
 
+/* A compatible .so must include SSL wrappers if the host may use TLS peers. */
+#if (NGX_COMPAT && !NGX_HTTP_SSL)
+#error "NTLM compatible modules require --with-http_ssl_module"
+#endif
+
 /* --- Struct Definitions --- */
+typedef enum {
+    NGX_NTLM_NO_AUTH = 0,
+    NGX_NTLM_OTHER_AUTH,
+    NGX_NTLM_AUTH,
+    NGX_NTLM_NEGOTIATE
+} ngx_http_upstream_ntlm_scheme_t;
+
+typedef enum {
+    NGX_NTLM_INVALID_TOKEN = 0,
+    NGX_NTLM_INITIAL_TOKEN,
+    NGX_NTLM_RESPONSE_TOKEN,
+    NGX_NTLM_CHALLENGE_TOKEN,
+    NGX_NTLM_COMPLETE_TOKEN
+} ngx_http_upstream_ntlm_token_t;
+
 typedef struct {
-    ngx_http_upstream_init_pt original_init_upstream;
     ngx_http_upstream_init_peer_pt original_init_peer;
+    unsigned enabled:1;
 } ngx_http_upstream_ntlm_srv_conf_t;
 
 /* Context representing the pinned state between a client and an upstream */
@@ -17,10 +37,12 @@ typedef struct {
     ngx_connection_t *upstream_conn;
     ngx_sockaddr_t upstream_sockaddr;
     socklen_t upstream_socklen;
-    u_char upstream_name_buf[NGX_SOCKADDR_STRLEN];
+    u_char upstream_name_buf[256];
     ngx_str_t upstream_name;
     ngx_msec_t pinned_time;
+    ngx_http_upstream_ntlm_scheme_t scheme;
     unsigned pinned:1;
+    unsigned pending:1;
 } ngx_http_upstream_ntlm_ctx_t;
 
 typedef struct {
@@ -40,13 +62,15 @@ typedef struct {
 #endif
     ngx_event_notify_peer_pt original_notify;
     ngx_str_t peer_name;
-    ngx_flag_t cached;
+    ngx_http_upstream_ntlm_scheme_t scheme;
+    ngx_http_upstream_ntlm_token_t token;
+    unsigned has_ntlm:1;
+    unsigned cached:1;
 } ngx_http_upstream_ntlm_peer_data_t;
 
 /* --- Function Prototypes --- */
 static void *ngx_http_upstream_ntlm_create_conf(ngx_conf_t *cf);
 static char *ngx_http_upstream_ntlm_directive(ngx_conf_t *cf, ngx_command_t *cmd, void *conf);
-static ngx_int_t ngx_http_upstream_init_ntlm(ngx_conf_t *cf, ngx_http_upstream_srv_conf_t *us);
 static ngx_int_t ngx_http_upstream_init_ntlm_peer(ngx_http_request_t *r, ngx_http_upstream_srv_conf_t *us);
 static ngx_int_t ngx_http_upstream_get_ntlm_peer(ngx_peer_connection_t *pc, void *data);
 static void ngx_http_upstream_free_ntlm_peer(ngx_peer_connection_t *pc, void *data, ngx_uint_t state);
@@ -56,7 +80,15 @@ static void ngx_http_upstream_ntlm_save_session(ngx_peer_connection_t *pc, void 
 #endif
 static void ngx_http_upstream_ntlm_notify_peer(ngx_peer_connection_t *pc, void *data, ngx_uint_t type);
 
+static ngx_http_upstream_ntlm_scheme_t ngx_http_upstream_ntlm_parse_scheme(ngx_str_t *value);
+static ngx_int_t ngx_http_upstream_ntlm_der(ngx_str_t *input, u_char tag, ngx_str_t *value);
+static ngx_http_upstream_ntlm_token_t ngx_http_upstream_ntlm_spnego(ngx_str_t token, ngx_uint_t challenge);
+static ngx_int_t ngx_http_upstream_ntlm_decode_token(ngx_http_request_t *r, ngx_str_t encoded, ngx_http_upstream_ntlm_scheme_t scheme, ngx_uint_t challenge);
+static ngx_int_t ngx_http_upstream_ntlm_check_challenge(ngx_http_upstream_ntlm_peer_data_t *my_data, ngx_http_upstream_ntlm_scheme_t scheme);
 static ngx_flag_t ngx_http_upstream_ntlm_has_auth_header(ngx_http_request_t *r);
+static ngx_flag_t ngx_http_upstream_ntlm_conn_dead(ngx_connection_t *c);
+static void ngx_http_upstream_ntlm_check_idle_alive(ngx_http_upstream_ntlm_ctx_t *ctx);
+static void ngx_http_upstream_ntlm_reset_ctx(ngx_http_upstream_ntlm_ctx_t *ctx);
 static void ngx_http_upstream_ntlm_detach_pinned(ngx_http_upstream_ntlm_ctx_t *ctx);
 static void ngx_http_upstream_ntlm_client_cleanup(void *data);
 static void ngx_http_upstream_ntlm_upstream_cleanup(void *data);
@@ -128,27 +160,387 @@ ngx_module_t ngx_http_upstream_ntlm_module = {
 };
 
 /* --- Helpers --- */
+static ngx_http_upstream_ntlm_scheme_t
+ngx_http_upstream_ntlm_parse_scheme(ngx_str_t *value)
+{
+    ngx_str_t name;
+
+    while (value->len && (value->data[0] == ' ' || value->data[0] == '\t')) {
+        value->data++;
+        value->len--;
+    }
+
+    if (value->len == 0) {
+        return NGX_NTLM_NO_AUTH;
+    }
+
+    name = *value;
+    while (value->len && value->data[0] != ' ' && value->data[0] != '\t') {
+        value->data++;
+        value->len--;
+    }
+    name.len -= value->len;
+
+    while (value->len && (value->data[0] == ' ' || value->data[0] == '\t')) {
+        value->data++;
+        value->len--;
+    }
+
+    if (name.len == 4
+        && ngx_strncasecmp(name.data, (u_char *) "NTLM", 4) == 0)
+    {
+        return NGX_NTLM_AUTH;
+    }
+
+    if (name.len == 9
+        && ngx_strncasecmp(name.data, (u_char *) "Negotiate", 9) == 0)
+    {
+        return NGX_NTLM_NEGOTIATE;
+    }
+
+    return NGX_NTLM_OTHER_AUTH;
+}
+
+static ngx_int_t
+ngx_http_upstream_ntlm_der(ngx_str_t *input, u_char tag, ngx_str_t *value)
+{
+    u_char *p, *last;
+    size_t len, n;
+
+    p = input->data;
+    last = p + input->len;
+    if (input->len < 2 || *p++ != tag) {
+        return NGX_ERROR;
+    }
+
+    len = *p++;
+    if (len & 0x80) {
+        n = len & 0x7f;
+        if (n == 0 || n > sizeof(size_t) || n > (size_t) (last - p)
+            || *p == 0)
+        {
+            return NGX_ERROR;
+        }
+        len = 0;
+        while (n--) {
+            len = (len << 8) | *p++;
+        }
+        if (len < 128) {
+            return NGX_ERROR;
+        }
+    }
+
+    if (len > (size_t) (last - p)) {
+        return NGX_ERROR;
+    }
+
+    value->data = p;
+    value->len = len;
+    input->data = p + len;
+    input->len = last - input->data;
+    return NGX_OK;
+}
+
+static ngx_http_upstream_ntlm_token_t
+ngx_http_upstream_ntlm_spnego(ngx_str_t token, ngx_uint_t challenge)
+{
+    ngx_str_t sequence, field, value;
+    ngx_uint_t state, payload, previous, tag;
+    u_char inner;
+
+    if (ngx_http_upstream_ntlm_der(&token, 0xa1, &field) != NGX_OK
+        || token.len
+        || ngx_http_upstream_ntlm_der(&field, 0x30, &sequence) != NGX_OK
+        || field.len)
+    {
+        return NGX_NTLM_INVALID_TOKEN;
+    }
+
+    /* SPNEGO negState values are 0..3; 4 indicates absent optional negState */
+    state = 4;
+    payload = 0;
+    previous = 0;
+    while (sequence.len) {
+        tag = sequence.data[0];
+        if (tag < 0xa0 || tag > 0xa3 || tag <= previous
+            || ngx_http_upstream_ntlm_der(&sequence, (u_char) tag, &field) != NGX_OK)
+        {
+            return NGX_NTLM_INVALID_TOKEN;
+        }
+
+        previous = tag;
+        inner = (tag == 0xa0) ? 0x0a : (tag == 0xa1) ? 0x06 : 0x04;
+        if (ngx_http_upstream_ntlm_der(&field, inner, &value) != NGX_OK
+            || field.len || value.len == 0)
+        {
+            return NGX_NTLM_INVALID_TOKEN;
+        }
+
+        if (tag == 0xa0) {
+            if (value.len != 1 || value.data[0] > 3) {
+                return NGX_NTLM_INVALID_TOKEN;
+            }
+            state = value.data[0];
+        } else if (tag >= 0xa2) {
+            payload = 1;
+        }
+    }
+
+    if (!challenge) {
+        return (payload && state != 2)
+               ? NGX_NTLM_RESPONSE_TOKEN : NGX_NTLM_INVALID_TOKEN;
+    }
+
+    if (state == 0 || state == 2) {
+        /* accept-completed (0) and reject (2) end continuation eligibility */
+        return NGX_NTLM_COMPLETE_TOKEN;
+    }
+
+    return (state == 1 || state == 3 || payload)
+           ? NGX_NTLM_CHALLENGE_TOKEN : NGX_NTLM_INVALID_TOKEN;
+}
+
+static ngx_int_t
+ngx_http_upstream_ntlm_decode_token(ngx_http_request_t *r, ngx_str_t encoded,
+    ngx_http_upstream_ntlm_scheme_t scheme, ngx_uint_t challenge)
+{
+    ngx_str_t token, body;
+    size_t i, pad;
+
+    while (encoded.len
+           && (encoded.data[encoded.len - 1] == ' '
+               || encoded.data[encoded.len - 1] == '\t'))
+    {
+        encoded.len--;
+    }
+
+    if (encoded.len == 0) {
+        return NGX_NTLM_INVALID_TOKEN;
+    }
+
+    /*
+     * ngx_decode_base64() stops scanning at the first '=' without inspecting
+     * trailing bytes; enforce RFC 9110 token68 padding rules explicitly.
+     */
+    pad = 0;
+    for (i = 0; i < encoded.len; i++) {
+        if (encoded.data[i] == '=') {
+            pad = encoded.len - i;
+            if (pad > 2 || (encoded.len % 4) != 0) {
+                return NGX_NTLM_INVALID_TOKEN;
+            }
+            for (; i < encoded.len; i++) {
+                if (encoded.data[i] != '=') {
+                    return NGX_NTLM_INVALID_TOKEN;
+                }
+            }
+            break;
+        }
+    }
+
+    token.data = ngx_pnalloc(r->pool, ngx_base64_decoded_length(encoded.len));
+    if (token.data == NULL) {
+        return NGX_ERROR;
+    }
+
+    if (ngx_decode_base64(&token, &encoded) != NGX_OK) {
+        return NGX_NTLM_INVALID_TOKEN;
+    }
+
+    if (token.len >= 12 && ngx_memcmp(token.data, "NTLMSSP\0", 8) == 0) {
+        if (token.data[9] || token.data[10] || token.data[11]) {
+            return NGX_NTLM_INVALID_TOKEN;
+        }
+
+        switch (token.data[8]) {
+        case 1:
+            return challenge ? NGX_NTLM_INVALID_TOKEN : NGX_NTLM_INITIAL_TOKEN;
+        case 2:
+            return challenge ? NGX_NTLM_CHALLENGE_TOKEN : NGX_NTLM_INVALID_TOKEN;
+        case 3:
+            return challenge ? NGX_NTLM_INVALID_TOKEN : NGX_NTLM_RESPONSE_TOKEN;
+        default:
+            return NGX_NTLM_INVALID_TOKEN;
+        }
+    }
+
+    if (scheme == NGX_NTLM_NEGOTIATE && token.len > 0) {
+        if (!challenge && token.data[0] == 0x60) {
+            return (ngx_http_upstream_ntlm_der(&token, 0x60, &body) == NGX_OK
+                    && token.len == 0 && body.len > 0)
+                   ? NGX_NTLM_INITIAL_TOKEN : NGX_NTLM_INVALID_TOKEN;
+        }
+        return ngx_http_upstream_ntlm_spnego(token, challenge);
+    }
+
+    return NGX_NTLM_INVALID_TOKEN;
+}
+
+/*
+ * Inspect upstream WWW-Authenticate headers for a matching continuation challenge.
+ * Returns 1 for a matching challenge, 0 for an explicit header without continuation,
+ * NGX_DECLINED if no WWW-Authenticate headers are present, or NGX_ERROR on OOM.
+ */
+static ngx_int_t
+ngx_http_upstream_ntlm_check_challenge(ngx_http_upstream_ntlm_peer_data_t *my_data,
+    ngx_http_upstream_ntlm_scheme_t scheme)
+{
+    ngx_list_part_t *part;
+    ngx_table_elt_t *header;
+    ngx_str_t value, entry;
+    ngx_uint_t i, quoted, seen;
+    ngx_int_t token;
+    u_char *p, *start, *last;
+
+    part = &my_data->upstream->headers_in.headers.part;
+    header = part->elts;
+    seen = 0;
+
+    for (i = 0; /* void */; i++) {
+        if (i == part->nelts) {
+            if (part->next == NULL) {
+                break;
+            }
+            part = part->next;
+            header = part->elts;
+            i = 0;
+        }
+
+        if (header[i].hash == 0
+            || header[i].key.len != sizeof("WWW-Authenticate") - 1
+            || ngx_strncasecmp(header[i].key.data,
+                               (u_char *) "WWW-Authenticate",
+                               sizeof("WWW-Authenticate") - 1) != 0)
+        {
+            continue;
+        }
+
+        seen = 1;
+        value = header[i].value;
+        p = value.data;
+        last = p + value.len;
+
+        while (p < last) {
+            while (p < last && (*p == ',' || *p == ' ' || *p == '\t')) {
+                p++;
+            }
+
+            start = p;
+            quoted = 0;
+            while (p < last) {
+                if (*p == '\\' && quoted && p + 1 < last) {
+                    p += 2;
+                    continue;
+                }
+                if (*p == '"') {
+                    quoted = !quoted;
+                } else if (*p == ',' && !quoted) {
+                    break;
+                }
+                p++;
+            }
+
+            entry.data = start;
+            entry.len = p - start;
+            if (ngx_http_upstream_ntlm_parse_scheme(&entry) != scheme) {
+                continue;
+            }
+
+            token = ngx_http_upstream_ntlm_decode_token(my_data->request, entry,
+                                                        scheme, 1);
+            if (token == NGX_ERROR) {
+                return NGX_ERROR;
+            }
+            if (token == NGX_NTLM_CHALLENGE_TOKEN) {
+                return 1;
+            }
+            if (token == NGX_NTLM_COMPLETE_TOKEN) {
+                return 0;
+            }
+        }
+    }
+
+    return seen ? 0 : NGX_DECLINED;
+}
+
 static ngx_flag_t
 ngx_http_upstream_ntlm_has_auth_header(ngx_http_request_t *r)
 {
     ngx_str_t auth_hdr;
+    ngx_http_upstream_ntlm_scheme_t scheme;
 
-    if (r->headers_in.authorization == NULL) {
+    if (r->headers_in.authorization == NULL
+        || r->headers_in.authorization->hash == 0)
+    {
         return 0;
     }
 
     auth_hdr = r->headers_in.authorization->value;
-    if ((auth_hdr.len >= 4
-         && ngx_strncasecmp(auth_hdr.data, (u_char *) "NTLM", 4) == 0
-         && (auth_hdr.len == 4 || auth_hdr.data[4] == ' '))
-        || (auth_hdr.len >= 9
-            && ngx_strncasecmp(auth_hdr.data, (u_char *) "Negotiate", 9) == 0
-            && (auth_hdr.len == 9 || auth_hdr.data[9] == ' ')))
-    {
-        return 1;
+    scheme = ngx_http_upstream_ntlm_parse_scheme(&auth_hdr);
+
+    return (scheme == NGX_NTLM_AUTH || scheme == NGX_NTLM_NEGOTIATE);
+}
+
+static ngx_flag_t
+ngx_http_upstream_ntlm_conn_dead(ngx_connection_t *c)
+{
+    return c->close
+           || c->read->eof
+           || c->read->error
+           || c->read->timedout
+           || c->write->error
+           || c->write->timedout;
+}
+
+/*
+ * Proactively verify that an idle pinned upstream socket has not been closed
+ * or dirtied by the backend before epoll delivered its read event. This ensures
+ * $ntlm_pinned / $ntlm_pinned_<upstream> (e.g. in access_by_lua_*) and
+ * get_ntlm_peer never treat a half-closed socket as alive on POST / unbuffered
+ * requests that Nginx cannot retry once bytes are sent.
+ */
+static void
+ngx_http_upstream_ntlm_check_idle_alive(ngx_http_upstream_ntlm_ctx_t *ctx)
+{
+    ngx_connection_t *uc;
+    char buf[1];
+    int n;
+
+    if (ctx == NULL || !ctx->pinned || ctx->upstream_conn == NULL) {
+        return;
     }
 
-    return 0;
+    uc = ctx->upstream_conn;
+    if (uc->fd == (ngx_socket_t) -1 || ngx_http_upstream_ntlm_conn_dead(uc)) {
+        ngx_http_upstream_ntlm_detach_pinned(ctx);
+        return;
+    }
+
+    n = recv(uc->fd, buf, 1, MSG_PEEK);
+    if (n == -1 && (ngx_socket_errno == NGX_EAGAIN || ngx_socket_errno == NGX_EINTR)) {
+        if (uc->read->ready) {
+            uc->read->ready = 0;
+            if (ngx_handle_read_event(uc->read, 0) != NGX_OK) {
+                ngx_http_upstream_ntlm_detach_pinned(ctx);
+            }
+        }
+        return;
+    }
+
+    ngx_http_upstream_ntlm_detach_pinned(ctx);
+}
+
+static void
+ngx_http_upstream_ntlm_reset_ctx(ngx_http_upstream_ntlm_ctx_t *ctx)
+{
+    ctx->upstream_conn = NULL;
+    ctx->pinned_time = 0;
+    ctx->scheme = NGX_NTLM_NO_AUTH;
+    ctx->pinned = 0;
+    ctx->pending = 0;
+    ctx->upstream_socklen = 0;
+    ctx->upstream_name.len = 0;
+    ctx->upstream_name.data = NULL;
 }
 
 static void
@@ -157,12 +549,7 @@ ngx_http_upstream_ntlm_detach_pinned(ngx_http_upstream_ntlm_ctx_t *ctx)
     ngx_connection_t *uc = ctx->upstream_conn;
     ngx_pool_cleanup_t *cln;
 
-    ctx->upstream_conn = NULL;
-    ctx->pinned_time = 0;
-    ctx->pinned = 0;
-    ctx->upstream_socklen = 0;
-    ctx->upstream_name.len = 0;
-    ctx->upstream_name.data = NULL;
+    ngx_http_upstream_ntlm_reset_ctx(ctx);
 
     if (uc) {
         cln = ngx_http_upstream_ntlm_get_upstream_cleanup(uc, 0);
@@ -170,8 +557,7 @@ ngx_http_upstream_ntlm_detach_pinned(ngx_http_upstream_ntlm_ctx_t *ctx)
             cln->data = NULL;
         }
 
-        uc->read->timedout = 1;
-        ngx_post_event(uc->read, &ngx_posted_events);
+        ngx_http_upstream_ntlm_close_upstream(uc);
     }
 }
 
@@ -191,6 +577,8 @@ static ngx_int_t
 ngx_http_upstream_ntlm_format_pinned_var(ngx_http_request_t *r,
     ngx_http_variable_value_t *v, ngx_http_upstream_ntlm_ctx_t *ctx)
 {
+    ngx_http_upstream_ntlm_check_idle_alive(ctx);
+
     if (ctx != NULL && ctx->pinned) {
         ngx_msec_t elapsed_ms = ngx_current_msec - ctx->pinned_time;
 
@@ -312,35 +700,16 @@ ngx_http_upstream_ntlm_create_conf(ngx_conf_t *cf) {
 
 static char *
 ngx_http_upstream_ntlm_directive(ngx_conf_t *cf, ngx_command_t *cmd, void *conf) {
-    ngx_http_upstream_srv_conf_t *uscf;
     ngx_http_upstream_ntlm_srv_conf_t *ncf = conf;
 
-    if (ncf->original_init_upstream != NULL) {
+    if (ncf->enabled) {
         return "is duplicate";
     }
 
-    uscf = ngx_http_conf_get_module_srv_conf(cf, ngx_http_upstream_module);
-
-    ncf->original_init_upstream = uscf->peer.init_upstream
-                                  ? uscf->peer.init_upstream
-                                  : ngx_http_upstream_init_round_robin;
-
-    uscf->peer.init_upstream = ngx_http_upstream_init_ntlm;
+    /* Defer peer.init wrapping to postconfiguration so balancing/keepalive run first */
+    ncf->enabled = 1;
 
     return NGX_CONF_OK;
-}
-
-static ngx_int_t
-ngx_http_upstream_init_ntlm(ngx_conf_t *cf, ngx_http_upstream_srv_conf_t *us) {
-    ngx_http_upstream_ntlm_srv_conf_t *ncf;
-
-    ncf = ngx_http_conf_upstream_srv_conf(us, ngx_http_upstream_ntlm_module);
-
-    if (ncf->original_init_upstream(cf, us) != NGX_OK) {
-        return NGX_ERROR;
-    }
-
-    return NGX_OK;
 }
 
 /* --- State & Cleanup Management --- */
@@ -354,7 +723,12 @@ ngx_http_upstream_ntlm_client_get_ctx(ngx_connection_t *c, ngx_http_upstream_srv
     for (cln = c->pool->cleanup; cln; cln = cln->next) {
         if (cln->handler == ngx_http_upstream_ntlm_client_cleanup) {
             ctx = cln->data;
-            if (us == NULL || ctx->upstream_srv_conf == us) {
+            if (us == NULL) {
+                ngx_http_upstream_ntlm_check_idle_alive(ctx);
+                if (ctx->pinned) {
+                    return ctx;
+                }
+            } else if (ctx->upstream_srv_conf == us) {
                 return ctx;
             }
         }
@@ -448,18 +822,32 @@ ngx_http_upstream_ntlm_upstream_cleanup(void *data) {
 
     if (ctx) {
         ngx_log_debug1(NGX_LOG_DEBUG_HTTP, ngx_cycle->log, 0, "ntlm: upstream cleanup %p", ctx);
-        ctx->upstream_conn = NULL;
-        ctx->pinned_time = 0;
-        ctx->pinned = 0;
-        ctx->upstream_socklen = 0;
-        ctx->upstream_name.len = 0;
-        ctx->upstream_name.data = NULL;
+        ngx_http_upstream_ntlm_reset_ctx(ctx);
     }
 }
 
 static void
 ngx_http_upstream_ntlm_close_upstream(ngx_connection_t *c)
 {
+    if (c->write->timer_set) {
+        ngx_del_timer(c->write);
+    }
+    if (c->read->timer_set) {
+        ngx_del_timer(c->read);
+    }
+
+    c->read->handler = ngx_http_upstream_ntlm_dummy_handler;
+    c->write->handler = ngx_http_upstream_ntlm_dummy_handler;
+
+    c->data = NULL;
+    c->idle = 0;
+    c->log = ngx_cycle->log;
+    c->read->log = ngx_cycle->log;
+    c->write->log = ngx_cycle->log;
+    if (c->pool) {
+        c->pool->log = ngx_cycle->log;
+    }
+
 #if (NGX_HTTP_SSL)
     if (c->ssl) {
         c->ssl->no_wait_shutdown = 1;
@@ -474,6 +862,7 @@ ngx_http_upstream_ntlm_close_upstream(ngx_connection_t *c)
 
     if (c->pool) {
         ngx_destroy_pool(c->pool);
+        c->pool = NULL;
     }
     ngx_close_connection(c);
 }
@@ -486,13 +875,28 @@ ngx_http_upstream_init_ntlm_peer(ngx_http_request_t *r, ngx_http_upstream_srv_co
     ngx_http_upstream_ntlm_peer_data_t *my_data;
     ngx_http_upstream_ntlm_srv_conf_t *ncf;
     ngx_http_upstream_ntlm_req_ctx_t *rctx;
-    ngx_flag_t has_ntlm;
+    ngx_http_upstream_ntlm_ctx_t *ctx;
+    ngx_http_upstream_ntlm_scheme_t scheme = NGX_NTLM_NO_AUTH;
+    ngx_http_upstream_ntlm_token_t token = NGX_NTLM_INVALID_TOKEN;
+    ngx_flag_t has_ntlm = 0;
 
     ncf = ngx_http_conf_upstream_srv_conf(us, ngx_http_upstream_ntlm_module);
 
-    has_ntlm = ngx_http_upstream_ntlm_has_auth_header(r);
-    if (has_ntlm) {
-        ngx_log_debug0(NGX_LOG_DEBUG_HTTP, r->connection->log, 0, "ntlm: auth header found");
+    if (r->headers_in.authorization != NULL
+        && r->headers_in.authorization->hash != 0)
+    {
+        ngx_str_t auth_hdr = r->headers_in.authorization->value;
+        scheme = ngx_http_upstream_ntlm_parse_scheme(&auth_hdr);
+        if (scheme == NGX_NTLM_AUTH || scheme == NGX_NTLM_NEGOTIATE) {
+            ngx_int_t decoded;
+            has_ntlm = 1;
+            ngx_log_debug0(NGX_LOG_DEBUG_HTTP, r->connection->log, 0, "ntlm: auth header found");
+            decoded = ngx_http_upstream_ntlm_decode_token(r, auth_hdr, scheme, 0);
+            if (decoded == NGX_ERROR) {
+                return NGX_ERROR;
+            }
+            token = (ngx_http_upstream_ntlm_token_t) decoded;
+        }
     }
 
 #if (NGX_HTTP_V2)
@@ -539,11 +943,6 @@ ngx_http_upstream_init_ntlm_peer(ngx_http_request_t *r, ngx_http_upstream_srv_co
     rctx->us = us;
     ngx_http_set_ctx(r, rctx, ngx_http_upstream_ntlm_module);
 
-    my_data = ngx_pcalloc(r->pool, sizeof(ngx_http_upstream_ntlm_peer_data_t));
-    if (my_data == NULL) {
-        return NGX_ERROR;
-    }
-
     if (ncf->original_init_peer(r, us) != NGX_OK) {
         return NGX_ERROR;
     }
@@ -551,30 +950,45 @@ ngx_http_upstream_init_ntlm_peer(ngx_http_request_t *r, ngx_http_upstream_srv_co
     /*
      * If the client switched to a different non-empty Authorization scheme
      * (e.g. Basic/Bearer) on an already-pinned connection, tear down the NTLM pin
-     * instead of mixing auth contexts. Ignore empty values (e.g. OpenResty's
-     * ngx.req.set_header("Authorization", "")).
+     * instead of mixing auth contexts. Empty values (e.g. OpenResty's
+     * ngx.req.set_header("Authorization", "")) parse as NGX_NTLM_NO_AUTH.
      */
-    if (r->headers_in.authorization != NULL
-        && r->headers_in.authorization->value.len > 0
-        && !has_ntlm)
-    {
-        ngx_http_upstream_ntlm_ctx_t *existing = ngx_http_upstream_ntlm_client_get_ctx(c, us, 0);
-        if (existing != NULL && existing->upstream_conn != NULL) {
+    if (scheme == NGX_NTLM_OTHER_AUTH) {
+        ctx = ngx_http_upstream_ntlm_client_get_ctx(c, us, 0);
+        if (ctx != NULL && (ctx->upstream_conn != NULL || ctx->pinned)) {
             ngx_log_debug0(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
                            "ntlm: non-NTLM Authorization header on pinned connection, releasing pin");
-            ngx_http_upstream_ntlm_detach_pinned(existing);
+            ngx_http_upstream_ntlm_detach_pinned(ctx);
         }
         return NGX_OK;
     }
 
-    my_data->ctx = ngx_http_upstream_ntlm_client_get_ctx(c, us, has_ntlm);
-    if (my_data->ctx == NULL) {
+    ctx = ngx_http_upstream_ntlm_client_get_ctx(c, us, has_ntlm);
+    if (ctx == NULL) {
         /* Fail closed on OOM when NTLM/Negotiate auth is present so it cannot leak to keepalive */
         return has_ntlm ? NGX_ERROR : NGX_OK;
     }
 
+    /*
+     * If no NTLM/Negotiate header is present and there is no live pinned socket,
+     * do not wrap peer.get/free so anonymous traffic uses shared keepalive and
+     * never re-pins after a prior pin was dropped.
+     */
+    if (!has_ntlm && (!ctx->pinned || ctx->upstream_conn == NULL)) {
+        return NGX_OK;
+    }
+
+    my_data = ngx_pcalloc(r->pool, sizeof(ngx_http_upstream_ntlm_peer_data_t));
+    if (my_data == NULL) {
+        return NGX_ERROR;
+    }
+
+    my_data->ctx = ctx;
     my_data->request = r;
     my_data->upstream = r->upstream;
+    my_data->scheme = scheme;
+    my_data->token = token;
+    my_data->has_ntlm = has_ntlm;
     my_data->original_peer_data = r->upstream->peer.data;
     my_data->original_get_peer  = r->upstream->peer.get;
     my_data->original_free_peer = r->upstream->peer.free;
@@ -609,46 +1023,65 @@ ngx_http_upstream_get_ntlm_peer(ngx_peer_connection_t *pc, void *data) {
     ngx_http_upstream_ntlm_ctx_t *ctx = my_data->ctx;
     ngx_connection_t *c;
 
+    /* get_peer may be re-entered on retry; always clear cached state first */
+    my_data->cached = 0;
+
+    ngx_http_upstream_ntlm_check_idle_alive(ctx);
+
     if (ctx->pinned && ctx->upstream_conn != NULL) {
         c = ctx->upstream_conn;
 
-        if (ctx->upstream_name.len > 0) {
-            my_data->peer_name.data = ngx_pnalloc(my_data->request->pool, ctx->upstream_name.len);
-            if (my_data->peer_name.data == NULL) {
-                return NGX_ERROR;
-            }
-            my_data->peer_name.len = ctx->upstream_name.len;
-            ngx_memcpy(my_data->peer_name.data, ctx->upstream_name.data, ctx->upstream_name.len);
-            pc->name = &my_data->peer_name;
+        /*
+         * Retire dead/closing sockets before reuse. An explicit Authorization
+         * header may reuse a pinned socket only to answer a pending same-scheme
+         * server challenge; new Type-1 / SPNEGO initial tokens, scheme changes,
+         * or unsolicited/invalid continuations start a fresh upstream socket.
+         */
+        if (ngx_http_upstream_ntlm_conn_dead(c)
+            || (my_data->scheme != NGX_NTLM_NO_AUTH
+                && (my_data->token != NGX_NTLM_RESPONSE_TOKEN
+                    || !ctx->pending
+                    || my_data->scheme != ctx->scheme)))
+        {
+            ngx_http_upstream_ntlm_detach_pinned(ctx);
         } else {
-            pc->name = &ctx->upstream_name;
+            if (ctx->upstream_name.len > 0) {
+                my_data->peer_name.data = ngx_pnalloc(my_data->request->pool, ctx->upstream_name.len);
+                if (my_data->peer_name.data == NULL) {
+                    return NGX_ERROR;
+                }
+                my_data->peer_name.len = ctx->upstream_name.len;
+                ngx_memcpy(my_data->peer_name.data, ctx->upstream_name.data, ctx->upstream_name.len);
+                pc->name = &my_data->peer_name;
+            } else {
+                pc->name = &ctx->upstream_name;
+            }
+
+            c->idle = 0;
+            c->sent = 0;
+            c->data = NULL;
+            c->log = pc->log;
+            c->read->log = pc->log;
+            c->write->log = pc->log;
+            c->pool->log = pc->log;
+
+            if (c->read->timer_set) {
+                ngx_del_timer(c->read);
+            }
+
+            pc->connection = c;
+            pc->sockaddr = &ctx->upstream_sockaddr.sockaddr;
+            pc->socklen = ctx->upstream_socklen;
+            pc->cached = 1;
+
+            /* Claim it from pinned idle state */
+            ctx->upstream_conn = NULL;
+            my_data->cached = 1;
+
+            return NGX_DONE;
         }
-
-        c->idle = 0;
-        c->sent = 0;
-        c->data = NULL;
-        c->log = pc->log;
-        c->read->log = pc->log;
-        c->write->log = pc->log;
-        c->pool->log = pc->log;
-
-        if (c->read->timer_set) {
-            ngx_del_timer(c->read);
-        }
-
-        pc->connection = c;
-        pc->sockaddr = &ctx->upstream_sockaddr.sockaddr;
-        pc->socklen = ctx->upstream_socklen;
-        pc->cached = 1;
-
-        /* Claim it from pinned idle state */
-        ctx->upstream_conn = NULL;
-        my_data->cached = 1;
-
-        return NGX_DONE;
     }
 
-    my_data->cached = 0;
     return my_data->original_get_peer(pc, my_data->original_peer_data);
 }
 
@@ -659,7 +1092,19 @@ ngx_http_upstream_free_ntlm_peer(ngx_peer_connection_t *pc, void *data, ngx_uint
     ngx_connection_t *c = pc->connection;
     ngx_http_upstream_t *u = my_data->upstream;
     ngx_pool_cleanup_t *cln;
+    ngx_http_upstream_ntlm_scheme_t effective_scheme;
+    ngx_int_t pending;
     size_t name_len;
+
+    /*
+     * If a pinned socket failed/was retired and a subsequent retry ran without
+     * NTLM/Negotiate auth, delegate directly to the underlying peer layer so
+     * unauthenticated retry sockets are neither pinned nor leaked.
+     */
+    if (!my_data->cached && !my_data->has_ntlm) {
+        my_data->original_free_peer(pc, my_data->original_peer_data, state);
+        return;
+    }
 
     if ((state & (NGX_PEER_FAILED | NGX_PEER_NEXT))
         || c == NULL
@@ -667,11 +1112,7 @@ ngx_http_upstream_free_ntlm_peer(ngx_peer_connection_t *pc, void *data, ngx_uint
         || !u->request_body_sent
         || ngx_terminate
         || ngx_exiting
-        || c->read->eof
-        || c->read->error
-        || c->read->timedout
-        || c->write->error
-        || c->write->timedout)
+        || ngx_http_upstream_ntlm_conn_dead(c))
     {
         goto invalid;
     }
@@ -680,7 +1121,14 @@ ngx_http_upstream_free_ntlm_peer(ngx_peer_connection_t *pc, void *data, ngx_uint
         goto invalid;
     }
 
+    effective_scheme = my_data->cached ? ctx->scheme : my_data->scheme;
+
     /* Perform all fallible operations before taking ownership (pc->connection = NULL) */
+    pending = ngx_http_upstream_ntlm_check_challenge(my_data, effective_scheme);
+    if (pending == NGX_ERROR) {
+        goto invalid;
+    }
+
     cln = ngx_http_upstream_ntlm_get_upstream_cleanup(c, 1);
     if (cln == NULL) {
         goto invalid;
@@ -697,6 +1145,10 @@ ngx_http_upstream_free_ntlm_peer(ngx_peer_connection_t *pc, void *data, ngx_uint
 
     cln->data = ctx;
     ctx->upstream_conn = c;
+    ctx->scheme = effective_scheme;
+    if (pending != NGX_DECLINED || my_data->scheme != NGX_NTLM_NO_AUTH) {
+        ctx->pending = (pending == 1);
+    }
     pc->connection = NULL;
 
     if (!ctx->pinned) {
@@ -749,19 +1201,29 @@ ngx_http_upstream_free_ntlm_peer(ngx_peer_connection_t *pc, void *data, ngx_uint
     return;
 
 invalid:
-    ctx->upstream_conn = NULL;
-    ctx->pinned_time = 0;
-    ctx->pinned = 0;
-    if (!my_data->cached) {
-        my_data->original_free_peer(pc, my_data->original_peer_data, state);
+    ngx_http_upstream_ntlm_reset_ctx(ctx);
+    if (my_data->cached) {
+        /* No balancer lease was acquired; consume the try for this attempt */
+        if (pc->tries) {
+            pc->tries--;
+        }
+        return;
     }
+
+    /*
+     * Release balancer accounting without exposing a rejected NTLM/Negotiate
+     * socket to shared keepalive pools; restore pc->connection so core closes it.
+     */
+    pc->connection = NULL;
+    my_data->original_free_peer(pc, my_data->original_peer_data, state);
+    pc->connection = c;
 }
 
 #if (NGX_HTTP_SSL)
 static ngx_int_t
 ngx_http_upstream_ntlm_set_session(ngx_peer_connection_t *pc, void *data) {
     ngx_http_upstream_ntlm_peer_data_t *my_data = data;
-    if (my_data->cached) {
+    if (!pc->connection || pc->cached || my_data->cached || !my_data->original_set_session) {
         return NGX_OK;  /* SSL session already active on pinned connection */
     }
     return my_data->original_set_session(pc, my_data->original_peer_data);
@@ -770,7 +1232,7 @@ ngx_http_upstream_ntlm_set_session(ngx_peer_connection_t *pc, void *data) {
 static void
 ngx_http_upstream_ntlm_save_session(ngx_peer_connection_t *pc, void *data) {
     ngx_http_upstream_ntlm_peer_data_t *my_data = data;
-    if (my_data->cached) {
+    if (!pc->connection || pc->cached || my_data->cached || !my_data->original_save_session) {
         return;
     }
     my_data->original_save_session(pc, my_data->original_peer_data);
@@ -781,7 +1243,7 @@ static void
 ngx_http_upstream_ntlm_notify_peer(ngx_peer_connection_t *pc, void *data, ngx_uint_t type) {
     ngx_http_upstream_ntlm_peer_data_t *my_data = data;
 
-    if (!my_data->cached) {
+    if (!my_data->cached && my_data->original_notify) {
         my_data->original_notify(pc, my_data->original_peer_data, type);
     }
 }
@@ -816,23 +1278,8 @@ close:
 
     ngx_log_debug2(NGX_LOG_DEBUG_HTTP, ev->log, 0, "ntlm: upstream backend closed %p (cln: %p)", c, cln);
 
-    if (c->write->timer_set) {
-        ngx_del_timer(c->write);
-    }
-    if (c->read->timer_set) {
-        ngx_del_timer(c->read);
-    }
-
-    c->read->handler = ngx_http_upstream_ntlm_dummy_handler;
-    c->write->handler = ngx_http_upstream_ntlm_dummy_handler;
-
     if (ctx) {
-        ctx->upstream_conn = NULL;
-        ctx->pinned_time = 0;
-        ctx->pinned = 0;
-        ctx->upstream_socklen = 0;
-        ctx->upstream_name.data = NULL;
-        ctx->upstream_name.len = 0;
+        ngx_http_upstream_ntlm_reset_ctx(ctx);
     }
 
     ngx_http_upstream_ntlm_close_upstream(c);
@@ -866,7 +1313,7 @@ ngx_http_upstream_ntlm_postconfiguration(ngx_conf_t *cf)
         }
 
         ncf = ngx_http_conf_upstream_srv_conf(uscfp[i], ngx_http_upstream_ntlm_module);
-        if (ncf->original_init_upstream == NULL) {
+        if (!ncf->enabled) {
             continue;
         }
 
@@ -884,12 +1331,14 @@ ngx_http_upstream_ntlm_postconfiguration(ngx_conf_t *cf)
     }
     *h = ngx_http_upstream_ntlm_access_handler;
 
+#if (nginx_version >= 1013010)
     /* Late for NTLM header set from Lua */
     h = ngx_array_push(&cmcf->phases[NGX_HTTP_PRECONTENT_PHASE].handlers);
     if (h == NULL) {
         return NGX_ERROR;
     }
     *h = ngx_http_upstream_ntlm_access_handler;
+#endif
 #endif
 
     return NGX_OK;
@@ -1054,9 +1503,12 @@ ngx_http_upstream_ntlm_access_handler(ngx_http_request_t *r)
     ngx_log_debug0(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
                    "ntlm: NTLM/Negotiate on HTTP/2, forcing client retry over HTTP/1.1");
 
-    if (!h2c->goaway) {
-        h2c->goaway = 1;
-        (void) ngx_http_upstream_ntlm_httpv2_send_goaway(h2c, NGX_HTTP_V2_HTTP_1_1_REQUIRED);
+    if (!h2c->connection->error && !h2c->goaway) {
+        if (ngx_http_upstream_ntlm_httpv2_send_goaway(h2c, NGX_HTTP_V2_HTTP_1_1_REQUIRED)
+            != NGX_ERROR)
+        {
+            h2c->goaway = 1;
+        }
     }
 
     if (!r->stream->rst_sent && r->stream->node != NULL) {
