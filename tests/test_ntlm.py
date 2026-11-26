@@ -493,9 +493,11 @@ http {{
             else ""
         )
 
+        user_directive = "user root;\n" if os.geteuid() == 0 else ""
+
         with open(conf_file, "w") as f:
             f.write(f"""
-load_module {ntlm_so};
+{user_directive}load_module {ntlm_so};
 worker_processes 1;
 pid {pid_file};
 error_log {err_log} debug;

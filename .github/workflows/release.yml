@@ -1,0 +1,102 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag to create or update (e.g. v1.0.0)"
+        type: string
+        required: true
+      nginx_version:
+        description: "Nginx release version to build against"
+        type: string
+        default: "1.30.8"
+      openresty_version:
+        description: "OpenResty release version to build against"
+        type: string
+        default: "1.31.9.1"
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    uses: ./.github/workflows/build.yml
+    with:
+      nginx_version: ${{ inputs.nginx_version || '1.30.8' }}
+      openresty_version: ${{ inputs.openresty_version || '1.31.9.1' }}
+
+  release:
+    name: Publish GitHub Release
+    needs: build
+    runs-on: ubuntu-24.04
+    defaults:
+      run:
+        shell: bash
+    env:
+      GH_TOKEN: ${{ github.token }}
+      NGINX_VERSION: ${{ inputs.nginx_version || '1.30.8' }}
+      OPENRESTY_VERSION: ${{ inputs.openresty_version || '1.31.9.1' }}
+      RELEASE_TAG: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Download built module artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Generate SHA-256 checksums and release notes
+        run: |
+          set -euo pipefail
+          cd dist
+          ls -lh *.so
+          sha256sum *.so | sort -k2 > SHA256SUMS.txt
+          cat SHA256SUMS.txt
+          cd ..
+
+          cat > release-notes.md <<EOF
+          Pre-built dynamic \`ngx_http_upstream_ntlm_module.so\` binaries compiled with \`--with-compat\` on Ubuntu 22.04 (glibc >= 2.35) and verified against the full end-to-end test suite:
+
+          | Target | Version | Architectures |
+          | :--- | :--- | :--- |
+          | **Nginx** | \`${NGINX_VERSION}\` | \`linux-amd64\`, \`linux-arm64\` |
+          | **OpenResty** | \`${OPENRESTY_VERSION}\` | \`linux-amd64\`, \`linux-arm64\` |
+
+          ### Installation
+          Download the \`.so\` matching your exact Nginx/OpenResty version and CPU architecture, verify its SHA-256 checksum, copy it to your modules directory as \`ngx_http_upstream_ntlm_module.so\`, and add at the top level of \`nginx.conf\`:
+
+          \`\`\`nginx
+          load_module modules/ngx_http_upstream_ntlm_module.so;
+          \`\`\`
+
+          ### SHA-256 Checksums
+          \`\`\`
+          $(cat dist/SHA256SUMS.txt)
+          \`\`\`
+          EOF
+
+      - name: Create or update GitHub Release
+        run: |
+          set -euo pipefail
+          if gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
+            echo "Release ${RELEASE_TAG} already exists; uploading updated assets..."
+            gh release upload "$RELEASE_TAG" dist/*.so dist/SHA256SUMS.txt --clobber
+          else
+            EXTRA_ARGS=()
+            if [ "${GITHUB_REF_TYPE}" = "tag" ]; then
+              EXTRA_ARGS+=(--verify-tag)
+            else
+              EXTRA_ARGS+=(--target "${GITHUB_SHA}")
+            fi
+            gh release create "$RELEASE_TAG" dist/*.so dist/SHA256SUMS.txt \
+              --title "$RELEASE_TAG" \
+              --notes-file release-notes.md \
+              --generate-notes \
+              "${EXTRA_ARGS[@]}"
+          fi
