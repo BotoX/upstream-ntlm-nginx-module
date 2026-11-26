@@ -19,6 +19,9 @@ jobs:
     # Build inside Ubuntu 22.04 (glibc 2.35) so released --with-compat .so files
     # load cleanly across Ubuntu 22.04/24.04/26.04, Debian 12/13, and RHEL 9+.
     container: ubuntu:22.04
+    defaults:
+      run:
+        shell: bash
     strategy:
       fail-fast: false
       matrix:
