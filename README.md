@@ -31,6 +31,17 @@ This module pins an upstream TCP connection to the client's TCP connection when 
 
 ---
 
+## Pre-built Releases
+
+Pre-built `--with-compat` dynamic modules (`.so`) for **Linux (`amd64` and `arm64`, glibc ≥ 2.35)** are built, tested, and published automatically via GitHub Actions on every tagged release (`v*`) for:
+
+- **Nginx** `1.30.8` (`ngx_http_upstream_ntlm_module-nginx-1.30.8-linux-{amd64,arm64}.so`)
+- **OpenResty** `1.31.9.1` (`ngx_http_upstream_ntlm_module-openresty-1.31.9.1-linux-{amd64,arm64}.so`)
+
+Download the matching `.so` and `SHA256SUMS.txt` from [GitHub Releases](https://github.com/BotoX/upstream-ntlm-nginx-module/releases), verify the checksum, and copy it into `/etc/nginx/modules/ngx_http_upstream_ntlm_module.so` (or `/usr/local/openresty/modules/ngx_http_upstream_ntlm_module.so`).
+
+---
+
 ## Building & Installing
 
 ### Option A: Standard Nginx

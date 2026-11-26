@@ -1,0 +1,142 @@
+name: Build and Test
+
+on:
+  workflow_call:
+    inputs:
+      nginx_version:
+        description: "Nginx release version to build against"
+        type: string
+        default: "1.30.8"
+      openresty_version:
+        description: "OpenResty release version to build against"
+        type: string
+        default: "1.31.9.1"
+
+jobs:
+  build:
+    name: ${{ matrix.flavor }} ${{ matrix.flavor == 'nginx' && inputs.nginx_version || inputs.openresty_version }} (${{ matrix.arch }})
+    runs-on: ${{ matrix.runner }}
+    # Build inside Ubuntu 22.04 (glibc 2.35) so released --with-compat .so files
+    # load cleanly across Ubuntu 22.04/24.04/26.04, Debian 12/13, and RHEL 9+.
+    container: ubuntu:22.04
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - flavor: nginx
+            arch: linux-amd64
+            runner: ubuntu-24.04
+          - flavor: nginx
+            arch: linux-arm64
+            runner: ubuntu-24.04-arm
+          - flavor: openresty
+            arch: linux-amd64
+            runner: ubuntu-24.04
+          - flavor: openresty
+            arch: linux-arm64
+            runner: ubuntu-24.04-arm
+
+    env:
+      TARGET_VERSION: ${{ matrix.flavor == 'nginx' && inputs.nginx_version || inputs.openresty_version }}
+      ARTIFACT_NAME: ngx_http_upstream_ntlm_module-${{ matrix.flavor }}-${{ matrix.flavor == 'nginx' && inputs.nginx_version || inputs.openresty_version }}-${{ matrix.arch }}.so
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Install build and test dependencies
+        run: |
+          apt-get update
+          DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+            build-essential \
+            binutils \
+            ca-certificates \
+            curl \
+            file \
+            libpcre2-dev \
+            libssl-dev \
+            openssl \
+            perl \
+            python3 \
+            zlib1g-dev
+          rm -rf /var/lib/apt/lists/*
+
+      - name: Build dynamic module for Nginx
+        if: matrix.flavor == 'nginx'
+        run: |
+          set -euo pipefail
+          mkdir -p /tmp/build /tmp/dist
+          cd /tmp/build
+          curl -fsSL --retry 3 --retry-delay 2 \
+            "https://nginx.org/download/nginx-${TARGET_VERSION}.tar.gz" \
+            -o "nginx-${TARGET_VERSION}.tar.gz"
+          tar -xzf "nginx-${TARGET_VERSION}.tar.gz"
+          cd "nginx-${TARGET_VERSION}"
+
+          ./configure \
+            --with-compat \
+            --with-http_ssl_module \
+            --with-http_v2_module \
+            --with-http_v3_module \
+            --with-cc-opt="-O2 -Wall -Wextra -Wno-unused-parameter -Werror" \
+            --add-dynamic-module="$GITHUB_WORKSPACE"
+          make -j"$(nproc)"
+
+          cp objs/ngx_http_upstream_ntlm_module.so "/tmp/dist/${ARTIFACT_NAME}"
+          strip --strip-unneeded "/tmp/dist/${ARTIFACT_NAME}"
+          echo "NGINX_BIN=/tmp/build/nginx-${TARGET_VERSION}/objs/nginx" >> "$GITHUB_ENV"
+
+      - name: Build dynamic module for OpenResty
+        if: matrix.flavor == 'openresty'
+        run: |
+          set -euo pipefail
+          mkdir -p /tmp/build /tmp/dist
+          cd /tmp/build
+          curl -fsSL --retry 3 --retry-delay 2 \
+            "https://openresty.org/download/openresty-${TARGET_VERSION}.tar.gz" \
+            -o "openresty-${TARGET_VERSION}.tar.gz"
+          tar -xzf "openresty-${TARGET_VERSION}.tar.gz"
+          cd "openresty-${TARGET_VERSION}"
+
+          ./configure \
+            --prefix=/usr/local/openresty \
+            --with-cc-opt="-O2 -DNGX_LUA_ABORT_AT_PANIC" \
+            --with-ld-opt="-Wl,-rpath,/usr/local/openresty/luajit/lib" \
+            --with-pcre-jit \
+            --with-stream \
+            --without-mail_pop3_module \
+            --without-mail_imap_module \
+            --without-mail_smtp_module \
+            --with-threads \
+            --with-compat \
+            --with-http_v2_module \
+            --with-http_ssl_module \
+            --add-dynamic-module="$GITHUB_WORKSPACE" \
+            -j"$(nproc)"
+          make -j"$(nproc)"
+          make install
+
+          SO_PATH="$(echo build/nginx-*/objs/ngx_http_upstream_ntlm_module.so)"
+          test -f "$SO_PATH"
+          cp "$SO_PATH" "/tmp/dist/${ARTIFACT_NAME}"
+          strip --strip-unneeded "/tmp/dist/${ARTIFACT_NAME}"
+          echo "NGINX_BIN=/usr/local/openresty/nginx/sbin/nginx" >> "$GITHUB_ENV"
+
+      - name: Inspect binary and run end-to-end test suite
+        run: |
+          set -euo pipefail
+          "$NGINX_BIN" -V
+          file "/tmp/dist/${ARTIFACT_NAME}"
+          ldd "/tmp/dist/${ARTIFACT_NAME}" || true
+          readelf --version-info "/tmp/dist/${ARTIFACT_NAME}" | grep -E 'GLIBC_' || true
+          sha256sum "/tmp/dist/${ARTIFACT_NAME}"
+          python3 tests/test_ntlm.py \
+            --nginx "$NGINX_BIN" \
+            --module "/tmp/dist/${ARTIFACT_NAME}"
+
+      - name: Upload built module artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.ARTIFACT_NAME }}
+          path: /tmp/dist/${{ env.ARTIFACT_NAME }}
+          if-no-files-found: error
